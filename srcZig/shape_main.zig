@@ -20,6 +20,7 @@ const DomainParticipantFactoryImpl = zzdds.dcps.DomainParticipantFactoryImpl;
 const DataWriterImpl               = zzdds.dcps.DataWriterImpl;
 const DataReaderImpl               = zzdds.dcps.DataReaderImpl;
 const TopicImpl                    = zzdds.dcps.TopicImpl;
+const ContentFilteredTopicImpl     = zzdds.dcps.ContentFilteredTopicImpl;
 const noop_security                = zzdds.noop_security.noop_security_plugins;
 const time_mod                     = zzdds.util.time;
 const RtpsTimestamp                = zzdds.util.time.RtpsTimestamp;
@@ -78,7 +79,8 @@ const Options = struct {
     num_iterations:       i64            = -1,   // -1 = infinite
     num_instances:        u32            = 1,
     additional_payload:   u32            = 0,
-    cft_expression:       ?[]const u8    = null, // content filter expression (unsupported)
+    size_modulo:          i32            = 0,    // 0 = no cycling (--size-modulo)
+    cft_expression:       ?[]const u8    = null, // content filter expression (--cft)
 };
 
 // ── CDR helpers ───────────────────────────────────────────────────────────────
@@ -393,7 +395,11 @@ fn runPublisher(
     const topic_impl: *TopicImpl = @ptrCast(@alignCast(topic.ptr));
     const topic_name = topic_impl.topic_name;
 
-    const pub_ = dp.vtable.create_publisher(dp.ptr, .{}, nil.nil_pub_listener, 0);
+    var pub_partition_name_buf: [1][]const u8 = .{opts.partition orelse ""};
+    const pub_qos: DDS.PublisherQos = if (opts.partition) |_| .{
+        .partition = .{ .name = .{ .items = &pub_partition_name_buf, .capacity = 1 } },
+    } else .{};
+    const pub_ = dp.vtable.create_publisher(dp.ptr, pub_qos, nil.nil_pub_listener, 0);
     if (pub_.ptr == nil.nil_pub_listener.ptr) return error.PublisherFailed;
 
     const dw_qos = try buildWriterQos(alloc, opts);
@@ -497,6 +503,8 @@ fn runPublisher(
 
         if (opts.shapesize == 0) {
             shape.shapesize += 1;
+            if (opts.size_modulo > 0 and shape.shapesize > opts.size_modulo)
+                shape.shapesize = 1;
         }
 
         last_write_ns = time_mod.nanoTimestamp();
@@ -515,9 +523,36 @@ fn runSubscriber(
 ) !void {
     const topic_impl: *TopicImpl = @ptrCast(@alignCast(topic.ptr));
     const topic_name = topic_impl.topic_name;
-    const topic_desc = topic_impl.toTopicDescription();
 
-    const sub = dp.vtable.create_subscriber(dp.ptr, .{}, nil.nil_sub_listener, 0);
+    // Create a ContentFilteredTopic when a filter expression was supplied (-c).
+    // The CFT's TopicDescription returns the underlying topic name over RTPS so
+    // remote writers match on the base topic, while the filter is applied locally.
+    const cft: ?DDS.ContentFilteredTopic = blk: {
+        const expr = opts.cft_expression orelse break :blk null;
+        const cft_name = std.fmt.allocPrint(
+            alloc, "{s}_cft", .{topic_name},
+        ) catch break :blk null;
+        defer alloc.free(cft_name);
+        const c = dp.vtable.create_contentfilteredtopic(
+            dp.ptr, cft_name, topic, expr, .empty,
+        );
+        if (c.ptr == nil.nil_dr_listener.ptr) break :blk null;
+        break :blk c;
+    };
+    defer {
+        if (cft) |c| _ = dp.vtable.delete_contentfilteredtopic(dp.ptr, c);
+    }
+
+    const topic_desc: DDS.TopicDescription = if (cft) |c| blk: {
+        const impl: *ContentFilteredTopicImpl = @ptrCast(@alignCast(c.ptr));
+        break :blk impl.toTopicDescription();
+    } else topic_impl.toTopicDescription();
+
+    var sub_partition_name_buf: [1][]const u8 = .{opts.partition orelse ""};
+    const sub_qos: DDS.SubscriberQos = if (opts.partition) |_| .{
+        .partition = .{ .name = .{ .items = &sub_partition_name_buf, .capacity = 1 } },
+    } else .{};
+    const sub = dp.vtable.create_subscriber(dp.ptr, sub_qos, nil.nil_sub_listener, 0);
     if (sub.ptr == nil.nil_sub_listener.ptr) return error.SubscriberFailed;
 
     const dr_qos = try buildReaderQos(alloc, opts);
@@ -546,6 +581,30 @@ fn runSubscriber(
         0;
     var deadline_base_ns: i64 = 0; // 0 = no matched writer yet
 
+    // Extract the CFT impl pointer once so the hot path can call matchSample.
+    const cft_impl: ?*ContentFilteredTopicImpl = if (cft) |c|
+        @ptrCast(@alignCast(c.ptr))
+    else
+        null;
+
+    // Field accessor backed by a ParsedShape — used for CFT evaluation.
+    const ShapeAccessor = struct {
+        shape: *const ParsedShape,
+
+        fn get(ctx: *anyopaque, field: []const u8) ?zzdds.dcps.filter.FilterValue {
+            const self: *const @This() = @ptrCast(@alignCast(ctx));
+            if (std.mem.eql(u8, field, "color"))
+                return .{ .string = self.shape.color };
+            if (std.mem.eql(u8, field, "x"))
+                return .{ .int = self.shape.x };
+            if (std.mem.eql(u8, field, "y"))
+                return .{ .int = self.shape.y };
+            if (std.mem.eql(u8, field, "shapesize"))
+                return .{ .int = self.shape.shapesize };
+            return null;
+        }
+    };
+
     var iteration: i64 = 0;
     while (!g_all_done.load(.acquire)) {
         if (opts.num_iterations >= 0 and iteration >= opts.num_iterations) break;
@@ -556,13 +615,23 @@ fn runSubscriber(
         }
 
         var got_data = false;
-        while (dr_impl.takeRaw()) |payload| {
-            defer alloc.free(payload);
+        while (dr_impl.takeRaw()) |taken| {
+            defer alloc.free(taken.data);
             got_data = true;
-            if (deserializeShape(payload)) |s| {
-                stdoutPrint("{s:<10} {s:<10} {d:0>3} {d:0>3} [{d}]\n",
-                    .{ topic_name, s.color, @as(u32, @intCast(s.x)), @as(u32, @intCast(s.y)), s.shapesize });
+            const s = deserializeShape(taken.data) orelse continue;
+
+            // Apply CFT filter when one is configured.
+            if (cft_impl) |ci| {
+                var acc_ctx = ShapeAccessor{ .shape = &s };
+                const accessor = zzdds.dcps.filter.FieldAccessor{
+                    .ctx = &acc_ctx,
+                    .get = ShapeAccessor.get,
+                };
+                if (!ci.matchSample(accessor)) continue;
             }
+
+            stdoutPrint("{s:<10} {s:<10} {d:0>3} {d:0>3} [{d}]\n",
+                .{ topic_name, s.color, @as(u32, @intCast(s.x)), @as(u32, @intCast(s.y)), s.shapesize });
         }
 
         if (got_data) {
@@ -649,10 +718,15 @@ fn parseArgs(process_args: std.process.Args) !Options {
         } else if (std.mem.eql(u8, arg, "--additional-payload-size")) {
             const v = it.next() orelse return error.MissingValue;
             opts.additional_payload = try std.fmt.parseInt(u32, v, 10);
+        } else if (std.mem.eql(u8, arg, "--cft")) {
+            const v = it.next() orelse return error.MissingValue;
+            opts.cft_expression = v;
+        } else if (std.mem.eql(u8, arg, "--size-modulo")) {
+            const v = it.next() orelse return error.MissingValue;
+            opts.size_modulo = try std.fmt.parseInt(i32, v, 10);
         } else if (std.mem.eql(u8, arg, "--time-filter") or
                    std.mem.eql(u8, arg, "--lifespan")     or
                    std.mem.eql(u8, arg, "--write-period") or
-                   std.mem.eql(u8, arg, "--size-modulo")  or
                    std.mem.eql(u8, arg, "--periodic-announcement") or
                    std.mem.eql(u8, arg, "--final-instance-state") or
                    std.mem.eql(u8, arg, "--access-scope") or
@@ -701,14 +775,6 @@ pub fn main(init: std.process.Init.Minimal) !void {
     if (!opts.publish and !opts.subscribe) {
         std.log.err("specify -P (publish) or -S (subscribe)", .{});
         std.process.exit(1);
-    }
-
-    // If the subscriber was given a content-filter expression (via -c when
-    // subscribing, which the C++ code turns into a CFT), report it as unsupported
-    // so the harness gets SUB_UNSUPPORTED_FEATURE rather than hanging.
-    if (opts.subscribe and opts.cft_expression != null) {
-        stdoutPrint("not supported: ContentFilteredTopic\n", .{});
-        return;
     }
 
     const udp = try UdpTransport.init(alloc, .{}, opts.domain_id, null);
