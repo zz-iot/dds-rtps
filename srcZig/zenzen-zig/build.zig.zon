@@ -5,12 +5,11 @@
     .minimum_zig_version = "0.16.0-dev.2848+b4ffb402c",
     .dependencies = .{
         .zzdds = .{
-            .path = "../../../ZenzenDDS",
+            .path = "../../../zz-dev/zzdds",
         },
     },
     .paths = .{
         "build.zig",
         "build.zig.zon",
-        "src",
     },
 }
