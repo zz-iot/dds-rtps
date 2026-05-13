@@ -5,6 +5,7 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
 
     const version = b.option([]const u8, "dds-version", "ZenzenDDS version string embedded in the executable name (default: 0.0.0)") orelse "0.0.0";
+    const sanitize_thread = b.option(bool, "sanitize-thread", "Enable ThreadSanitizer (requires libc, Linux only)") orelse false;
 
     const zzdds_dep = b.dependency("zzdds", .{ .target = target, .optimize = optimize });
     const zzdds_mod = zzdds_dep.module("zzdds");
@@ -36,6 +37,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     exe.root_module.link_libc = true;
+    exe.root_module.sanitize_thread = sanitize_thread;
     b.installArtifact(exe);
 
     const run_step = b.step("run", "Run shape_main");
