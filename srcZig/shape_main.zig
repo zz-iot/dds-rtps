@@ -442,7 +442,8 @@ fn runPublisher(
     const pub_ = dp.vtable.create_publisher(dp.ptr, pub_qos, dds.nilPublisherListener(), 0);
     if (isNilPub(pub_)) return error.PublisherFailed;
 
-    const dw_qos = try buildWriterQos(alloc, opts);
+    var dw_qos = try buildWriterQos(alloc, opts);
+    defer dw_qos.data_representation.value.deinit(alloc);
 
     var lctx = ListenerCtx{ .topic_name = topic_name };
     const dw_listener = DDS.DataWriterListener{
@@ -577,7 +578,8 @@ fn runSubscriber(
     const sub = dp.vtable.create_subscriber(dp.ptr, sub_qos, dds.nilSubscriberListener(), 0);
     if (isNilSub(sub)) return error.SubscriberFailed;
 
-    const dr_qos = try buildReaderQos(alloc, opts);
+    var dr_qos = try buildReaderQos(alloc, opts);
+    defer dr_qos.data_representation.value.deinit(alloc);
 
     var lctx = ListenerCtx{ .topic_name = topic_name };
     const dr_listener = DDS.DataReaderListener{
