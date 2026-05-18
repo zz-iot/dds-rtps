@@ -1,7 +1,7 @@
 .{
     .name = .zzdds_shape_main,
     .version = "0.0.0",
-    .fingerprint = 0x59a7de95ffa6098c,
+    .fingerprint = 0x336e9664cb8850f7,
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
         .zzdds = .{
