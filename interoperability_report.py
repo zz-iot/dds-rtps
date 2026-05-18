@@ -65,6 +65,21 @@ def stop_process(child_process, timeout=30, poll_interval=0.2):
 
     return return_value
 
+def drain_process_output(child_process, timeout=0.1):
+    """Drain pending output from a pexpect child so its pty cannot fill."""
+    try:
+        child_process.expect([pexpect.EOF, pexpect.TIMEOUT], timeout=timeout)
+    except (pexpect.EOF, pexpect.TIMEOUT):
+        pass
+
+def wait_for_events_and_drain(child_process, events, timeout=0.1):
+    """Wait for multiprocessing events while continuing to drain child output."""
+    while not all(element.is_set() for element in events):
+        if child_process.isalive():
+            drain_process_output(child_process, timeout)
+        else:
+            time.sleep(timeout)
+
 def run_subscriber_shape_main(
         name_executable: str,
         parameters: str,
@@ -212,8 +227,7 @@ def run_subscriber_shape_main(
     subscriber_finished.set()   # set subscriber as finished
     log_message(f'Subscriber {subscriber_index}: Waiting for Publishers to '
             'finish', verbosity)
-    for element in publishers_finished:
-        element.wait() # wait for all publishers to finish
+    wait_for_events_and_drain(child_sub, publishers_finished)
     # Stop process
     if not stop_process(child_sub):
         log_message(f'Subscriber {subscriber_index} process did not exit '
@@ -401,8 +415,7 @@ def run_publisher_shape_main(
 
     log_message(f'Publisher {publisher_index}: Waiting for Subscribers to finish',
             verbosity)
-    for element in subscribers_finished:
-        element.wait() # wait for all subscribers to finish
+    wait_for_events_and_drain(child_pub, subscribers_finished)
     publisher_finished.set()   # set publisher as finished
     # Stop process
     if not stop_process(child_pub):

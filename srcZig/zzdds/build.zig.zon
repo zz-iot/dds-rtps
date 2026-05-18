@@ -1,5 +1,5 @@
 .{
-    .name = .zenzen_dds_shape_main,
+    .name = .zzdds_shape_main,
     .version = "0.0.0",
     .fingerprint = 0x59a7de95ffa6098c,
     .minimum_zig_version = "0.16.0",

@@ -30,7 +30,7 @@ pub fn build(b: *std.Build) void {
         },
     });
 
-    const exe_name = std.fmt.allocPrint(b.allocator, "zenzen_dds-{s}_shape_main_linux", .{version}) catch @panic("OOM");
+    const exe_name = std.fmt.allocPrint(b.allocator, "zzdds-{s}_shape_main_linux", .{version}) catch @panic("OOM");
     const shape_main_options = b.addOptions();
     shape_main_options.addOption([]const u8, "log_level", @tagName(log_level));
 
