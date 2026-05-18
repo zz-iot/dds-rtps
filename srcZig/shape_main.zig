@@ -17,6 +17,12 @@
 const std = @import("std");
 const dds = @import("dds");
 const DDS = dds.DDS;
+const shape_main_options = @import("shape_main_options");
+
+pub const std_options: std.Options = .{
+    .log_level = std.meta.stringToEnum(std.log.Level, shape_main_options.log_level) orelse
+        @compileError("invalid shape_main log level"),
+};
 
 // ── Time helpers ─────────────────────────────────────────────────────────────
 // std.time.nanoTimestamp / std.time.sleep were removed in Zig 0.16.
@@ -744,6 +750,50 @@ fn parseArgs(process_args: std.process.Args) !Options {
             std.mem.eql(u8, arg, "--ordered"))
         {
             // boolean flags — ignore
+        } else if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
+            stdoutWrite(
+                \\Usage: shape_main -P|-S [options]
+                \\
+                \\Mode (required):
+                \\  -P                  Publisher
+                \\  -S                  Subscriber
+                \\
+                \\QoS:
+                \\  -b                  BEST_EFFORT reliability (default: RELIABLE)
+                \\  -r                  RELIABLE reliability (explicit)
+                \\  -k <depth>          History depth; 0 = KEEP_ALL (default: KEEP_LAST 1)
+                \\  -D v|l|t|p          Durability: volatile, transient-local, transient, persistent
+                \\  -f <ms>             Deadline period in milliseconds
+                \\  -s <strength>       Ownership strength (enables EXCLUSIVE ownership)
+                \\  -x 1|2              Data representation: 1=XCDR1 (default), 2=XCDR2
+                \\  -p <name>           Partition name
+                \\
+                \\Topic / data:
+                \\  -t <name>           Topic name (default: Square)
+                \\  -c <color>          Color / key value (default: BLUE)
+                \\  -z <size>           Shape size; 0 = auto-increment each sample (default: 20)
+                \\  -n <count>          Number of instances to publish (default: 1)
+                \\  --additional-payload <bytes>  Extra zero bytes appended to each sample
+                \\  --size-modulo <n>   Cycle shapesize 1..n when -z 0 is active
+                \\  --cft <expr>        Content filter expression (subscriber only)
+                \\
+                \\Timing / iterations:
+                \\  -i, --num-iterations <n>   Stop after n samples (-1 = infinite, default)
+                \\  --write-period <ms>         Publish interval in ms (default: 33)
+                \\  --read-period <ms>          Read poll interval in ms (default: 100)
+                \\
+                \\Other:
+                \\  -d <id>             Domain ID (default: 0)
+                \\  -w                  Print each sample on the writer side
+                \\  -h, --help          Show this help and exit
+                \\
+                \\Environment variables:
+                \\  SHAPE_STARTUP_DELAY_MS=<ms>   Sleep before creating the DDS participant.
+                \\                                Useful for late-join testing without relying
+                \\                                on fixed sleeps in the test harness.
+                \\
+            );
+            std.process.exit(0);
         } else if (std.mem.startsWith(u8, arg, "--") or std.mem.startsWith(u8, arg, "-")) {
             std.log.warn("unrecognised option: {s}", .{arg});
         }
@@ -770,6 +820,11 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const alloc = gpa.allocator();
+
+    if (std.c.getenv("SHAPE_STARTUP_DELAY_MS")) |v| {
+        const ms = std.fmt.parseInt(u64, std.mem.span(v), 10) catch 0;
+        if (ms > 0) sleepNs(ms * std.time.ns_per_ms);
+    }
 
     const opts = parseArgs(init.args) catch |err| {
         std.log.err("argument error: {}", .{err});

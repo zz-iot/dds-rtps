@@ -4,8 +4,15 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    const LogLevel = enum { err, warn, info, debug };
+
     const version = b.option([]const u8, "dds-version", "ZenzenDDS version string embedded in the executable name (default: 0.0.0)") orelse "0.0.0";
     const sanitize_thread = b.option(bool, "sanitize-thread", "Enable ThreadSanitizer (requires libc, Linux only)") orelse false;
+    const default_log_level: LogLevel = switch (optimize) {
+        .Debug => .debug,
+        .ReleaseSafe, .ReleaseFast, .ReleaseSmall => .info,
+    };
+    const log_level = b.option(LogLevel, "log-level", "shape_main std.log level: err, warn, info, debug (default matches Zig build mode)") orelse default_log_level;
 
     const zzdds_dep = b.dependency("zzdds", .{ .target = target, .optimize = optimize });
     const zzdds_mod = zzdds_dep.module("zzdds");
@@ -24,6 +31,8 @@ pub fn build(b: *std.Build) void {
     });
 
     const exe_name = std.fmt.allocPrint(b.allocator, "zenzen_dds-{s}_shape_main_linux", .{version}) catch @panic("OOM");
+    const shape_main_options = b.addOptions();
+    shape_main_options.addOption([]const u8, "log_level", @tagName(log_level));
 
     const exe = b.addExecutable(.{
         .name = exe_name,
@@ -33,6 +42,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "dds", .module = dds_mod },
+                .{ .name = "shape_main_options", .module = shape_main_options.createModule() },
             },
         }),
     });
