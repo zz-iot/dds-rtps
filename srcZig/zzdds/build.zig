@@ -6,7 +6,7 @@ pub fn build(b: *std.Build) void {
 
     const LogLevel = enum { err, warn, info, debug };
 
-    const version = b.option([]const u8, "dds-version", "ZenzenDDS version string embedded in the executable name (default: 0.0.0)") orelse "0.0.0";
+    const version = b.option([]const u8, "dds-version", "Full zzdds version string for the executable name (e.g. 0.1.0-zig.0.16.0); omit for a stable CI-friendly name");
     const sanitize_thread = b.option(bool, "sanitize-thread", "Enable ThreadSanitizer (requires libc, Linux only)") orelse false;
     const default_log_level: LogLevel = switch (optimize) {
         .Debug => .debug,
@@ -30,7 +30,10 @@ pub fn build(b: *std.Build) void {
         },
     });
 
-    const exe_name = std.fmt.allocPrint(b.allocator, "zzdds-{s}_shape_main_linux", .{version}) catch @panic("OOM");
+    const exe_name = if (version) |v|
+        std.fmt.allocPrint(b.allocator, "zzdds-{s}_shape_main_linux", .{v}) catch @panic("OOM")
+    else
+        "zzdds_shape_main_linux";
     const shape_main_options = b.addOptions();
     shape_main_options.addOption([]const u8, "log_level", @tagName(log_level));
 
