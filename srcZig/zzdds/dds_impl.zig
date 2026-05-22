@@ -56,7 +56,7 @@ pub fn createParticipant(alloc: std.mem.Allocator, domain_id: u32) !*Participant
         transport,
         discovery,
         noop_security,
-        .random,
+        .spec_random,
         .{},
     );
     errdefer factory.deinit();
