@@ -187,20 +187,48 @@ fn serializeShape(buf: *std.ArrayList(u8), alloc: std.mem.Allocator, s: ShapeDat
 }
 
 // Compute 16-byte key hash from CDR-serialised key (color string).
-// DDS spec: use the raw serialised key when it fits in 16 bytes, else MD5.
+// DDS spec §9.6.3.8: key is CDR_BE (big-endian) serialization of the key fields.
+// When the serialised key fits in 16 bytes, the hash is the raw bytes zero-padded.
 fn colorKeyHash(color: []const u8) [16]u8 {
     var kh = std.mem.zeroes([16]u8);
-    // CDR key: u32 length (LE) + chars + '\0'
     const clen: u32 = @intCast(color.len + 1);
     const klen: usize = 4 + clen;
     if (klen <= 16) {
-        std.mem.writeInt(u32, kh[0..4], clen, .little);
+        std.mem.writeInt(u32, kh[0..4], clen, .big);
         @memcpy(kh[4..][0..color.len], color);
         // null at [4 + color.len]; already zero from zeroes()
     } else {
         // Fall back to zeroes — MD5 not implemented; works for typical test colors
     }
     return kh;
+}
+
+// Derive the key hash from a received CDR payload by parsing out the color field.
+// Used as the TypeSupport compute_key_hash callback so the reader-side participant
+// can recover instance identity when the writer omitted the inline-QoS key_hash.
+fn shapeTypeKeyHash(payload: []const u8) [16]u8 {
+    if (payload.len < 4) return std.mem.zeroes([16]u8);
+    const encap = payload[1];
+    var off: usize = 4; // skip 4-byte encapsulation header
+
+    // XCDR2 @appendable (encap 0x08 or 0x09): skip 4-byte struct DHEADER
+    if (encap == 0x08 or encap == 0x09) {
+        if (payload.len < off + 4) return std.mem.zeroes([16]u8);
+        off += 4;
+    }
+
+    if (payload.len < off + 4) return std.mem.zeroes([16]u8);
+    // String length endianness matches the payload: odd encap byte → little-endian
+    const is_le = (encap & 0x01) != 0;
+    const clen: u32 = if (is_le)
+        std.mem.readInt(u32, payload[off..][0..4], .little)
+    else
+        std.mem.readInt(u32, payload[off..][0..4], .big);
+    off += 4;
+    if (clen == 0 or payload.len < off + clen) return std.mem.zeroes([16]u8);
+    const color = payload[off .. off + clen - 1]; // strip null terminator
+
+    return colorKeyHash(color);
 }
 
 const ParsedShape = struct {
@@ -842,6 +870,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
     };
     defer dds.destroyParticipant(participant);
     const dp = participant.toDDS();
+
+    dds.registerTypeSupport(dp, "ShapeType", .{ .compute_key_hash = shapeTypeKeyHash });
 
     const topic = dp.vtable.create_topic(
         dp.ptr,

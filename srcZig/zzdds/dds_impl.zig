@@ -14,6 +14,7 @@ pub const DDS = zzdds_gen.DDS;
 const UdpTransport = zzdds.udp_transport.UdpTransport;
 const SpdpSedpDiscovery = zzdds.combined_discovery.SpdpSedpDiscovery;
 const DomainParticipantFactoryImpl = zzdds.dcps.DomainParticipantFactoryImpl;
+const DomainParticipantImpl = zzdds.dcps.DomainParticipantImpl;
 const DataWriterImpl = zzdds.dcps.DataWriterImpl;
 const DataReaderImpl = zzdds.dcps.DataReaderImpl;
 const TopicImpl = zzdds.dcps.TopicImpl;
@@ -159,6 +160,19 @@ pub fn cftMatchSample(cft: DDS.ContentFilteredTopic, acc: FieldAccessor) bool {
 pub fn cftTopicDescription(cft: DDS.ContentFilteredTopic) DDS.TopicDescription {
     const impl: *ContentFilteredTopicImpl = @ptrCast(@alignCast(cft.ptr));
     return impl.toTopicDescription();
+}
+
+// ── TypeSupport ───────────────────────────────────────────────────────────────
+
+pub const TypeSupport = zzdds.dcps.TypeSupport;
+
+pub fn registerTypeSupport(
+    dp: DDS.DomainParticipant,
+    type_name: []const u8,
+    ts: TypeSupport,
+) void {
+    const impl: *DomainParticipantImpl = @ptrCast(@alignCast(dp.ptr));
+    impl.registerTypeSupport(type_name, ts);
 }
 
 // ── Nil sentinel helpers ──────────────────────────────────────────────────────

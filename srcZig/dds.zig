@@ -73,6 +73,21 @@
 //!
 //!   pub fn cftMatchSample(cft: DDS.ContentFilteredTopic, acc: FieldAccessor) bool;
 //!   pub fn cftTopicDescription(cft: DDS.ContentFilteredTopic) DDS.TopicDescription;
+//!
+//!   ── TypeSupport (type schema registration) ────────────────────────────
+//!
+//!   pub const TypeSupport = struct {
+//!       compute_key_hash: *const fn (payload: []const u8) [16]u8,
+//!   };
+//!
+//!   pub fn registerTypeSupport(dp: DDS.DomainParticipant,
+//!                              type_name: []const u8,
+//!                              ts: TypeSupport) void;
+//!     Register a key-hash computation callback for a named type.  Call
+//!     before creating DataReaders for that type so that received changes
+//!     whose inline-QoS omits a key_hash can have one computed from the
+//!     CDR payload.  `payload` passed to compute_key_hash includes the
+//!     4-byte CDR encapsulation header.
 
 // This file is documentation only.  shape_main.zig imports the module
 // named "dds" which is provided by the vendor's build.zig, not this file.
