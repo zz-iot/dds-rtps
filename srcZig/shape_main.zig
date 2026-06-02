@@ -623,10 +623,10 @@ fn runSubscriber(
     const listener_mask: DDS.StatusMask =
         DDS.REQUESTED_INCOMPATIBLE_QOS_STATUS | DDS.REQUESTED_DEADLINE_MISSED_STATUS;
 
+    stdoutPrint("Create reader for topic: {s}\n", .{topic_name});
+
     const dr = sub.vtable.create_datareader(sub.ptr, topic_desc, dr_qos, dr_listener, listener_mask);
     if (isNilDr(dr)) return error.DataReaderFailed;
-
-    stdoutPrint("Create reader for topic: {s}\n", .{topic_name});
 
     const sub_deadline_ns: i64 = if (opts.deadline_ms > 0)
         @intCast(opts.deadline_ms * std.time.ns_per_ms)
