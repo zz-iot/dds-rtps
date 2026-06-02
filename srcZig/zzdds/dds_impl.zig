@@ -125,6 +125,7 @@ pub fn writerNotifyDeadline(dw: DDS.DataWriter) void {
 pub const TakenSample = struct {
     data: []u8,
     alloc: std.mem.Allocator,
+    instance_state: DDS.InstanceStateKind,
 
     pub fn deinit(self: TakenSample) void {
         self.alloc.free(self.data);
@@ -134,7 +135,11 @@ pub const TakenSample = struct {
 pub fn takeRaw(dr: DDS.DataReader) ?TakenSample {
     const impl: *DataReaderImpl = @ptrCast(@alignCast(dr.ptr));
     const taken = impl.takeRaw() orelse return null;
-    return .{ .data = taken.data, .alloc = impl.alloc };
+    return .{
+        .data = taken.data,
+        .alloc = impl.alloc,
+        .instance_state = taken.info.instance_state,
+    };
 }
 
 pub fn readerMatchedCount(dr: DDS.DataReader) usize {

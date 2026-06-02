@@ -95,6 +95,13 @@ const Options = struct {
     additional_payload: u32 = 0,
     size_modulo: i32 = 0, // 0 = no cycling (--size-modulo)
     cft_expression: ?[]const u8 = null, // content filter expression (--cft)
+    time_filter_ms: u64 = 0, // TIME_BASED_FILTER minimum_separation in ms (--time-filter)
+    final_instance_state: u8 = 0, // 0=none, 'u'=unregister, 'd'=dispose (--final-instance-state)
+    access_scope: u8 = 'i', // 'i'=instance (default), 't'=topic, 'g'=group (--access-scope)
+    ordered_access: bool = false, // --ordered
+    coherent_access: bool = false, // --coherent
+    num_topics: u32 = 1, // --num-topics (>1 not supported)
+    take_read: bool = false, // --take-read (not supported)
 };
 
 // ── CDR helpers ───────────────────────────────────────────────────────────────
@@ -156,7 +163,10 @@ fn serializeShape(buf: *std.ArrayList(u8), alloc: std.mem.Allocator, s: ShapeDat
         off += 4;
         try writeU32Le(buf, alloc, s.payload);
         off += 4;
-        for (0..s.payload) |_| try buf.append(alloc, 0);
+        if (s.payload > 0) {
+            for (0..s.payload - 1) |_| try buf.append(alloc, 0);
+            try buf.append(alloc, 255); // last byte = 255 for integrity check
+        }
         // Patch DHEADER = length of struct members (bytes after DHEADER)
         const member_len: u32 = @intCast(buf.items.len - dheader_pos - 4);
         std.mem.writeInt(u32, buf.items[dheader_pos..][0..4], member_len, .little);
@@ -182,8 +192,22 @@ fn serializeShape(buf: *std.ArrayList(u8), alloc: std.mem.Allocator, s: ShapeDat
         off += 4;
         try writeU32Le(buf, alloc, s.payload);
         off += 4;
-        for (0..s.payload) |_| try buf.append(alloc, 0);
+        if (s.payload > 0) {
+            for (0..s.payload - 1) |_| try buf.append(alloc, 0);
+            try buf.append(alloc, 255);
+        }
     }
+}
+
+// Serialize a key-only CDR payload (XCDR1) containing just the color string.
+// Used for dispose/unregister writes where only the key matters.
+fn serializeShapeKeyOnly(buf: *std.ArrayList(u8), alloc: std.mem.Allocator, color: []const u8) !void {
+    buf.clearRetainingCapacity();
+    try buf.appendSlice(alloc, &[4]u8{ 0x00, 0x01, 0x00, 0x00 }); // CDR_LE header
+    const clen: u32 = @intCast(color.len + 1);
+    try writeU32Le(buf, alloc, clen);
+    try buf.appendSlice(alloc, color);
+    try buf.append(alloc, 0);
 }
 
 // Compute 16-byte key hash from CDR-serialised key (color string).
@@ -236,6 +260,7 @@ const ParsedShape = struct {
     x: i32,
     y: i32,
     shapesize: i32,
+    last_payload_byte: ?u8 = null, // set when additional_payload > 0
 };
 
 // Deserialize a CDR/CDR2 ShapeType payload.  Returns null on error / key-only.
@@ -268,8 +293,35 @@ fn deserializeShape(payload: []const u8) ?ParsedShape {
     const y = std.mem.readInt(i32, payload[off..][0..4], .little);
     off += 4;
     const shapesize = std.mem.readInt(i32, payload[off..][0..4], .little);
+    off += 4;
 
-    return ParsedShape{ .color = color, .x = x, .y = y, .shapesize = shapesize };
+    // Optional additional payload: u32 length followed by that many bytes.
+    var last_byte: ?u8 = null;
+    if (payload.len >= off + 4) {
+        const extra_len = std.mem.readInt(u32, payload[off..][0..4], .little);
+        off += 4;
+        if (extra_len > 0 and payload.len >= off + extra_len) {
+            last_byte = payload[off + extra_len - 1];
+        }
+    }
+
+    return ParsedShape{ .color = color, .x = x, .y = y, .shapesize = shapesize, .last_payload_byte = last_byte };
+}
+
+// Extract color key from a CDR payload (works for key-only and full payloads).
+fn deserializeShapeKey(payload: []const u8) []const u8 {
+    if (payload.len < 4) return "";
+    const encap = payload[1];
+    var off: usize = 4;
+    if (encap == 0x08 or encap == 0x09) {
+        if (payload.len < off + 4) return "";
+        off += 4;
+    }
+    if (payload.len < off + 4) return "";
+    const clen = std.mem.readInt(u32, payload[off..][0..4], .little);
+    off += 4;
+    if (clen == 0 or payload.len < off + clen) return "";
+    return payload[off .. off + clen - 1];
 }
 
 // ── Policy name mapping ───────────────────────────────────────────────────────
@@ -429,6 +481,13 @@ fn buildReaderQos(alloc: std.mem.Allocator, opts: *const Options) !DDS.DataReade
         else => .VOLATILE_DURABILITY_QOS,
     };
 
+    if (opts.time_filter_ms > 0) {
+        qos.time_based_filter.minimum_separation = .{
+            .sec = @intCast(opts.time_filter_ms / 1000),
+            .nanosec = @intCast((opts.time_filter_ms % 1000) * std.time.ns_per_ms),
+        };
+    }
+
     const repr_id: i16 = if (opts.data_representation == 2) 2 else 0;
     try qos.data_representation.value.append(alloc, repr_id);
 
@@ -469,10 +528,20 @@ fn runPublisher(
     const color = opts.color orelse "BLUE";
     const topic_name = dds.topicName(topic);
 
+    const pub_presentation = DDS.PresentationQosPolicy{
+        .access_scope = switch (opts.access_scope) {
+            't' => .TOPIC_PRESENTATION_QOS,
+            'g' => .GROUP_PRESENTATION_QOS,
+            else => .INSTANCE_PRESENTATION_QOS,
+        },
+        .coherent_access = opts.coherent_access,
+        .ordered_access = opts.ordered_access,
+    };
     var pub_partition_name_buf: [1][]const u8 = .{opts.partition orelse ""};
     const pub_qos: DDS.PublisherQos = if (opts.partition) |_| .{
+        .presentation = pub_presentation,
         .partition = .{ .name = .{ .items = &pub_partition_name_buf, .capacity = 1 } },
-    } else .{};
+    } else .{ .presentation = pub_presentation };
     const pub_ = dp.vtable.create_publisher(dp.ptr, pub_qos, dds.nilPublisherListener(), 0);
     if (isNilPub(pub_)) return error.PublisherFailed;
 
@@ -566,6 +635,29 @@ fn runPublisher(
         iteration += 1;
         sleepNs(opts.write_period_ms * std.time.ns_per_ms);
     }
+
+    // Unregister/dispose all instances when the publisher exits with a finite num_iterations.
+    // For explicit --final-instance-state, use the requested kind; otherwise default to .unregister
+    // so that DataReader instances transition to NOT_ALIVE_NO_WRITERS (DDS spec §2.2.2.4.1.13).
+    if (opts.num_iterations >= 0) {
+        const kind: dds.WriteKind = switch (opts.final_instance_state) {
+            'd' => .dispose,
+            else => .unregister,
+        };
+        for (0..opts.num_instances) |inst| {
+            const inst_color: []const u8 = blk: {
+                if (inst == 0) break :blk color;
+                break :blk std.fmt.allocPrint(alloc, "{s}{d}", .{ color, inst }) catch color;
+            };
+            defer if (inst > 0) alloc.free(inst_color);
+            const key_hash = colorKeyHash(inst_color);
+            try serializeShapeKeyOnly(&buf, alloc, inst_color);
+            dds.writeRaw(dw, kind, key_hash, buf.items) catch {};
+        }
+        // Brief drain to let RELIABLE transport deliver the NOT_ALIVE changes before
+        // the participant is torn down.
+        sleepNs(300 * std.time.ns_per_ms);
+    }
 }
 
 // ── Subscriber ────────────────────────────────────────────────────────────────
@@ -578,8 +670,17 @@ fn runSubscriber(
 ) !void {
     const topic_name = dds.topicName(topic);
 
+    // When -c COLOR is passed to a subscriber without --cft, synthesize a color filter.
+    var synth_cft_buf: [64]u8 = undefined;
+    const effective_cft_expr: ?[]const u8 = if (opts.cft_expression) |e|
+        e
+    else if (opts.color) |c|
+        std.fmt.bufPrint(&synth_cft_buf, "color = '{s}'", .{c}) catch null
+    else
+        null;
+
     const cft: ?DDS.ContentFilteredTopic = blk: {
-        const expr = opts.cft_expression orelse break :blk null;
+        const expr = effective_cft_expr orelse break :blk null;
         const cft_name = std.fmt.allocPrint(
             alloc,
             "{s}_cft",
@@ -605,10 +706,20 @@ fn runSubscriber(
     else
         dp.vtable.lookup_topicdescription(dp.ptr, dds.topicName(topic));
 
+    const sub_presentation = DDS.PresentationQosPolicy{
+        .access_scope = switch (opts.access_scope) {
+            't' => .TOPIC_PRESENTATION_QOS,
+            'g' => .GROUP_PRESENTATION_QOS,
+            else => .INSTANCE_PRESENTATION_QOS,
+        },
+        .coherent_access = opts.coherent_access,
+        .ordered_access = opts.ordered_access,
+    };
     var sub_partition_name_buf: [1][]const u8 = .{opts.partition orelse ""};
     const sub_qos: DDS.SubscriberQos = if (opts.partition) |_| .{
+        .presentation = sub_presentation,
         .partition = .{ .name = .{ .items = &sub_partition_name_buf, .capacity = 1 } },
-    } else .{};
+    } else .{ .presentation = sub_presentation };
     const sub = dp.vtable.create_subscriber(dp.ptr, sub_qos, dds.nilSubscriberListener(), 0);
     if (isNilSub(sub)) return error.SubscriberFailed;
 
@@ -663,6 +774,19 @@ fn runSubscriber(
         while (dds.takeRaw(dr)) |taken| {
             defer taken.deinit();
             got_data = true;
+
+            if (taken.instance_state == DDS.NOT_ALIVE_NO_WRITERS_INSTANCE_STATE or
+                taken.instance_state == DDS.NOT_ALIVE_DISPOSED_INSTANCE_STATE)
+            {
+                const key = deserializeShapeKey(taken.data);
+                const state_str = if (taken.instance_state == DDS.NOT_ALIVE_DISPOSED_INSTANCE_STATE)
+                    "NOT_ALIVE_DISPOSED_INSTANCE_STATE"
+                else
+                    "NOT_ALIVE_NO_WRITERS_INSTANCE_STATE";
+                stdoutPrint("{s:<10} {s:<10} {s}\n", .{ topic_name, key, state_str });
+                continue;
+            }
+
             const s = deserializeShape(taken.data) orelse continue;
 
             if (cft) |c| {
@@ -674,7 +798,11 @@ fn runSubscriber(
                 if (!dds.cftMatchSample(c, accessor)) continue;
             }
 
-            stdoutPrint("{s:<10} {s:<10} {d:0>3} {d:0>3} [{d}]\n", .{ topic_name, s.color, @as(u32, @intCast(s.x)), @as(u32, @intCast(s.y)), s.shapesize });
+            if (s.last_payload_byte) |lb| {
+                stdoutPrint("{s:<10} {s:<10} {d:0>3} {d:0>3} [{d}] {{{d}}}\n", .{ topic_name, s.color, @as(u32, @intCast(s.x)), @as(u32, @intCast(s.y)), s.shapesize, lb });
+            } else {
+                stdoutPrint("{s:<10} {s:<10} {d:0>3} {d:0>3} [{d}]\n", .{ topic_name, s.color, @as(u32, @intCast(s.x)), @as(u32, @intCast(s.y)), s.shapesize });
+            }
         }
 
         if (got_data) {
@@ -741,7 +869,9 @@ fn parseArgs(process_args: std.process.Args) !Options {
         } else if (std.mem.eql(u8, arg, "-z")) {
             const v = it.next() orelse return error.MissingValue;
             opts.shapesize = std.fmt.parseInt(i32, v, 10) catch 20;
-        } else if (std.mem.eql(u8, arg, "-n")) {
+        } else if (std.mem.eql(u8, arg, "-n") or
+            std.mem.eql(u8, arg, "--num-instances"))
+        {
             const v = it.next() orelse return error.MissingValue;
             opts.num_instances = std.fmt.parseInt(u32, v, 10) catch 1;
         } else if (std.mem.eql(u8, arg, "--write-period")) {
@@ -755,7 +885,9 @@ fn parseArgs(process_args: std.process.Args) !Options {
         {
             const v = it.next() orelse return error.MissingValue;
             opts.num_iterations = std.fmt.parseInt(i64, v, 10) catch -1;
-        } else if (std.mem.eql(u8, arg, "--additional-payload")) {
+        } else if (std.mem.eql(u8, arg, "--additional-payload") or
+            std.mem.eql(u8, arg, "--additional-payload-size"))
+        {
             const v = it.next() orelse return error.MissingValue;
             opts.additional_payload = std.fmt.parseInt(u32, v, 10) catch 0;
         } else if (std.mem.eql(u8, arg, "--size-modulo")) {
@@ -763,21 +895,32 @@ fn parseArgs(process_args: std.process.Args) !Options {
             opts.size_modulo = std.fmt.parseInt(i32, v, 10) catch 0;
         } else if (std.mem.eql(u8, arg, "--cft")) {
             opts.cft_expression = it.next() orelse return error.MissingValue;
+        } else if (std.mem.eql(u8, arg, "--time-filter")) {
+            const v = it.next() orelse return error.MissingValue;
+            opts.time_filter_ms = std.fmt.parseInt(u64, v, 10) catch 0;
+        } else if (std.mem.eql(u8, arg, "--final-instance-state")) {
+            const v = it.next() orelse return error.MissingValue;
+            opts.final_instance_state = if (v.len > 0) v[0] else 0;
+        } else if (std.mem.eql(u8, arg, "--access-scope")) {
+            const v = it.next() orelse return error.MissingValue;
+            opts.access_scope = if (v.len > 0) v[0] else 'i';
+        } else if (std.mem.eql(u8, arg, "--ordered")) {
+            opts.ordered_access = true;
+        } else if (std.mem.eql(u8, arg, "--coherent")) {
+            opts.coherent_access = true;
+        } else if (std.mem.eql(u8, arg, "--num-topics")) {
+            const v = it.next() orelse return error.MissingValue;
+            opts.num_topics = std.fmt.parseInt(u32, v, 10) catch 1;
+        } else if (std.mem.eql(u8, arg, "--take-read")) {
+            opts.take_read = true;
         } else if (std.mem.eql(u8, arg, "--publisher-matches") or
             std.mem.eql(u8, arg, "--subscriber-matches") or
             std.mem.eql(u8, arg, "--deadline") or
             std.mem.eql(u8, arg, "--periodic-announcement") or
-            std.mem.eql(u8, arg, "--final-instance-state") or
-            std.mem.eql(u8, arg, "--access-scope") or
-            std.mem.eql(u8, arg, "--coherent-sample-count") or
-            std.mem.eql(u8, arg, "--take-read"))
+            std.mem.eql(u8, arg, "--coherent-sample-count"))
         {
             // consume argument value and ignore — unimplemented options
             _ = it.next();
-        } else if (std.mem.eql(u8, arg, "--coherent") or
-            std.mem.eql(u8, arg, "--ordered"))
-        {
-            // boolean flags — ignore
         } else if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
             stdoutWrite(
                 \\Usage: shape_main -P|-S [options]
@@ -862,6 +1005,16 @@ pub fn main(init: std.process.Init.Minimal) !void {
     if (!opts.publish and !opts.subscribe) {
         std.log.err("specify -P (publish) or -S (subscribe)", .{});
         std.process.exit(1);
+    }
+
+    // Signal unsupported features to the test harness so it marks them as vendor-skipped.
+    if (opts.num_topics > 1) {
+        stdoutPrint("not supported: --num-topics > 1\n", .{});
+        return;
+    }
+    if (opts.take_read) {
+        stdoutPrint("not supported: --take-read\n", .{});
+        return;
     }
 
     const participant = dds.createParticipant(alloc, opts.domain_id) catch |err| {
