@@ -18,6 +18,27 @@ pub fn build(b: *std.Build) void {
     const zzdds_mod = zzdds_dep.module("zzdds");
     const zzdds_gen = zzdds_dep.module("zzdds_generated");
 
+    // Acquire zidl executable and zidl_rt module from the zidl dependency.
+    const zidl_dep = b.dependency("zidl", .{ .target = target, .optimize = optimize });
+    const zidl_exe = zidl_dep.artifact("zidl");
+    const zidl_rt_mod = zidl_dep.module("zidl_rt");
+
+    // Generate ShapeType Zig bindings from srcZig/shape.idl.
+    // Output lands in the build cache (not checked in).
+    const gen_shape = b.addRunArtifact(zidl_exe);
+    gen_shape.addArgs(&.{ "-b", "zig", "--split-files", "-o" });
+    const shape_gen_dir = gen_shape.addOutputDirectoryArg("shape-generated");
+    gen_shape.addFileArg(b.path("../shape.idl"));
+
+    const shape_gen_mod = b.createModule(.{
+        .root_source_file = shape_gen_dir.path(b, "shape.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "zidl_rt", .module = zidl_rt_mod },
+        },
+    });
+
     // Build the "dds" shim module from our vendor implementation.
     // shape_main.zig imports only this module; it has no direct zzdds dependency.
     const dds_mod = b.createModule(.{
@@ -27,6 +48,8 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "zzdds", .module = zzdds_mod },
             .{ .name = "zzdds_generated", .module = zzdds_gen },
+            .{ .name = "shape_gen", .module = shape_gen_mod },
+            .{ .name = "zidl_rt", .module = zidl_rt_mod },
         },
     });
 

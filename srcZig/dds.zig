@@ -89,5 +89,46 @@
 //!     CDR payload.  `payload` passed to compute_key_hash includes the
 //!     4-byte CDR encapsulation header.
 
+// ── ShapeType serialization (Option B) ────────────────────────────────────────
+//
+// shape_main.zig delegates all CDR serialization and key-hash computation to
+// the vendor module so each vendor can handle type support however they like —
+// generated code from their IDL compiler, hand-coded CDR, etc.  For zzdds the
+// implementations live in dds_impl.zig and will eventually be produced by zidl
+// from srcZig/shape.idl.
+//
+//   pub const ShapeType = struct {
+//       color: []const u8,
+//       x: i32,
+//       y: i32,
+//       shapesize: i32,
+//       additional_payload: u32,  // extra CDR bytes appended by publisher (test harness)
+//       last_payload_byte: ?u8,   // last byte of received payload (null if absent)
+//   };
+//
+//   pub fn serializeShape(
+//       buf: *std.ArrayList(u8), alloc: std.mem.Allocator,
+//       s: ShapeType, xcdr2: bool) !void;
+//     Serialize `s` into `buf` (cleared first).  xcdr2 selects XCDR2 DELIMITED_CDR.
+//
+//   pub fn serializeShapeKeyOnly(
+//       buf: *std.ArrayList(u8), alloc: std.mem.Allocator,
+//       color: []const u8) !void;
+//     Serialize a key-only CDR_LE payload containing just `color`.
+//
+//   pub fn deserializeShape(payload: []const u8) ?ShapeType;
+//     Parse CDR/CDR2 bytes into ShapeType.  Returns null on error or key-only payload.
+//     Returned `color` slice borrows from `payload`; valid while `payload` is alive.
+//
+//   pub fn deserializeShapeKey(payload: []const u8) []const u8;
+//     Extract the color key string from any ShapeType CDR payload (full or key-only).
+//
+//   pub fn shapeKeyHash(color: []const u8) [16]u8;
+//     Compute the RTPS 16-byte key hash for a given color string.
+//
+//   pub fn shapeKeyHashFromCdr(payload: []const u8) [16]u8;
+//     Compute the RTPS key hash from a received CDR payload.
+//     Passed as TypeSupport.compute_key_hash to registerTypeSupport.
+
 // This file is documentation only.  shape_main.zig imports the module
 // named "dds" which is provided by the vendor's build.zig, not this file.

@@ -104,225 +104,12 @@ const Options = struct {
     take_read: bool = false, // --take-read (not supported)
 };
 
-// ── CDR helpers ───────────────────────────────────────────────────────────────
-
-fn writeU32Le(buf: *std.ArrayList(u8), alloc: std.mem.Allocator, v: u32) !void {
-    var b: [4]u8 = undefined;
-    std.mem.writeInt(u32, &b, v, .little);
-    try buf.appendSlice(alloc, &b);
-}
-
-fn writeI32Le(buf: *std.ArrayList(u8), alloc: std.mem.Allocator, v: i32) !void {
-    var b: [4]u8 = undefined;
-    std.mem.writeInt(i32, &b, v, .little);
-    try buf.appendSlice(alloc, &b);
-}
-
-fn align4(n: usize) usize {
-    return (n + 3) & ~@as(usize, 3);
-}
-
-// ── ShapeType CDR serialization ───────────────────────────────────────────────
-
-const ShapeData = struct {
-    color: []const u8,
-    x: i32,
-    y: i32,
-    shapesize: i32,
-    payload: u32, // additional_payload_size sequence length (all-zero bytes)
-};
-
-// Serialize ShapeType with a 4-byte encapsulation header.
-// xcdr2=false → CDR_LE (XCDR1): @appendable treated as @final, no DHEADER.
-// xcdr2=true  → DELIMITED_CDR_LE (XCDR2): 4-byte DHEADER before struct members.
-fn serializeShape(buf: *std.ArrayList(u8), alloc: std.mem.Allocator, s: ShapeData, xcdr2: bool) !void {
-    buf.clearRetainingCapacity();
-
-    if (xcdr2) {
-        // DELIMITED_CDR_LE encapsulation (XCDR2 @appendable)
-        try buf.appendSlice(alloc, &[4]u8{ 0x00, 0x09, 0x00, 0x00 });
-        // Placeholder for DHEADER (filled in below)
-        const dheader_pos = buf.items.len;
-        try writeU32Le(buf, alloc, 0);
-
-        var off: usize = 0;
-        const clen: u32 = @intCast(s.color.len + 1);
-        try writeU32Le(buf, alloc, clen);
-        off += 4;
-        try buf.appendSlice(alloc, s.color);
-        try buf.append(alloc, 0);
-        off += clen;
-        const pad = align4(off) - off;
-        for (0..pad) |_| try buf.append(alloc, 0);
-        off += pad;
-        try writeI32Le(buf, alloc, s.x);
-        off += 4;
-        try writeI32Le(buf, alloc, s.y);
-        off += 4;
-        try writeI32Le(buf, alloc, s.shapesize);
-        off += 4;
-        try writeU32Le(buf, alloc, s.payload);
-        off += 4;
-        if (s.payload > 0) {
-            for (0..s.payload - 1) |_| try buf.append(alloc, 0);
-            try buf.append(alloc, 255); // last byte = 255 for integrity check
-        }
-        // Patch DHEADER = length of struct members (bytes after DHEADER)
-        const member_len: u32 = @intCast(buf.items.len - dheader_pos - 4);
-        std.mem.writeInt(u32, buf.items[dheader_pos..][0..4], member_len, .little);
-    } else {
-        // CDR_LE encapsulation (XCDR1)
-        try buf.appendSlice(alloc, &[4]u8{ 0x00, 0x01, 0x00, 0x00 });
-
-        var off: usize = 0;
-        const clen: u32 = @intCast(s.color.len + 1);
-        try writeU32Le(buf, alloc, clen);
-        off += 4;
-        try buf.appendSlice(alloc, s.color);
-        try buf.append(alloc, 0);
-        off += clen;
-        const pad = align4(off) - off;
-        for (0..pad) |_| try buf.append(alloc, 0);
-        off += pad;
-        try writeI32Le(buf, alloc, s.x);
-        off += 4;
-        try writeI32Le(buf, alloc, s.y);
-        off += 4;
-        try writeI32Le(buf, alloc, s.shapesize);
-        off += 4;
-        try writeU32Le(buf, alloc, s.payload);
-        off += 4;
-        if (s.payload > 0) {
-            for (0..s.payload - 1) |_| try buf.append(alloc, 0);
-            try buf.append(alloc, 255);
-        }
-    }
-}
-
-// Serialize a key-only CDR payload (XCDR1) containing just the color string.
-// Used for dispose/unregister writes where only the key matters.
-fn serializeShapeKeyOnly(buf: *std.ArrayList(u8), alloc: std.mem.Allocator, color: []const u8) !void {
-    buf.clearRetainingCapacity();
-    try buf.appendSlice(alloc, &[4]u8{ 0x00, 0x01, 0x00, 0x00 }); // CDR_LE header
-    const clen: u32 = @intCast(color.len + 1);
-    try writeU32Le(buf, alloc, clen);
-    try buf.appendSlice(alloc, color);
-    try buf.append(alloc, 0);
-}
-
-// Compute 16-byte key hash from CDR-serialised key (color string).
-// DDS spec §9.6.3.8: key is CDR_BE (big-endian) serialization of the key fields.
-// When the serialised key fits in 16 bytes, the hash is the raw bytes zero-padded.
-fn colorKeyHash(color: []const u8) [16]u8 {
-    var kh = std.mem.zeroes([16]u8);
-    const clen: u32 = @intCast(color.len + 1);
-    const klen: usize = 4 + clen;
-    if (klen <= 16) {
-        std.mem.writeInt(u32, kh[0..4], clen, .big);
-        @memcpy(kh[4..][0..color.len], color);
-        // null at [4 + color.len]; already zero from zeroes()
-    } else {
-        // Fall back to zeroes — MD5 not implemented; works for typical test colors
-    }
-    return kh;
-}
-
-// Derive the key hash from a received CDR payload by parsing out the color field.
-// Used as the TypeSupport compute_key_hash callback so the reader-side participant
-// can recover instance identity when the writer omitted the inline-QoS key_hash.
-fn shapeTypeKeyHash(payload: []const u8) [16]u8 {
-    if (payload.len < 4) return std.mem.zeroes([16]u8);
-    const encap = payload[1];
-    var off: usize = 4; // skip 4-byte encapsulation header
-
-    // XCDR2 @appendable (encap 0x08 or 0x09): skip 4-byte struct DHEADER
-    if (encap == 0x08 or encap == 0x09) {
-        if (payload.len < off + 4) return std.mem.zeroes([16]u8);
-        off += 4;
-    }
-
-    if (payload.len < off + 4) return std.mem.zeroes([16]u8);
-    // String length endianness matches the payload: odd encap byte → little-endian
-    const is_le = (encap & 0x01) != 0;
-    const clen: u32 = if (is_le)
-        std.mem.readInt(u32, payload[off..][0..4], .little)
-    else
-        std.mem.readInt(u32, payload[off..][0..4], .big);
-    off += 4;
-    if (clen == 0 or payload.len < off + clen) return std.mem.zeroes([16]u8);
-    const color = payload[off .. off + clen - 1]; // strip null terminator
-
-    return colorKeyHash(color);
-}
-
-const ParsedShape = struct {
-    color: []const u8, // slice into payload; valid while payload is alive
-    x: i32,
-    y: i32,
-    shapesize: i32,
-    last_payload_byte: ?u8 = null, // set when additional_payload > 0
-};
-
-// Deserialize a CDR/CDR2 ShapeType payload.  Returns null on error / key-only.
-fn deserializeShape(payload: []const u8) ?ParsedShape {
-    if (payload.len < 4) return null;
-
-    const encap = payload[1];
-    var off: usize = 4; // skip 4-byte encap header
-
-    // XCDR2 @appendable: skip 4-byte struct DHEADER
-    if (encap == 0x08 or encap == 0x09) {
-        if (payload.len < off + 4) return null;
-        off += 4;
-    }
-
-    // color string
-    if (payload.len < off + 4) return null;
-    const clen = std.mem.readInt(u32, payload[off..][0..4], .little);
-    off += 4;
-    if (clen == 0 or payload.len < off + clen) return null;
-    const color = payload[off .. off + clen - 1]; // strip null terminator
-    off += clen;
-
-    // pad to 4-byte
-    off = align4(off);
-
-    if (payload.len < off + 12) return null; // x + y + shapesize
-    const x = std.mem.readInt(i32, payload[off..][0..4], .little);
-    off += 4;
-    const y = std.mem.readInt(i32, payload[off..][0..4], .little);
-    off += 4;
-    const shapesize = std.mem.readInt(i32, payload[off..][0..4], .little);
-    off += 4;
-
-    // Optional additional payload: u32 length followed by that many bytes.
-    var last_byte: ?u8 = null;
-    if (payload.len >= off + 4) {
-        const extra_len = std.mem.readInt(u32, payload[off..][0..4], .little);
-        off += 4;
-        if (extra_len > 0 and payload.len >= off + extra_len) {
-            last_byte = payload[off + extra_len - 1];
-        }
-    }
-
-    return ParsedShape{ .color = color, .x = x, .y = y, .shapesize = shapesize, .last_payload_byte = last_byte };
-}
-
-// Extract color key from a CDR payload (works for key-only and full payloads).
-fn deserializeShapeKey(payload: []const u8) []const u8 {
-    if (payload.len < 4) return "";
-    const encap = payload[1];
-    var off: usize = 4;
-    if (encap == 0x08 or encap == 0x09) {
-        if (payload.len < off + 4) return "";
-        off += 4;
-    }
-    if (payload.len < off + 4) return "";
-    const clen = std.mem.readInt(u32, payload[off..][0..4], .little);
-    off += 4;
-    if (clen == 0 or payload.len < off + clen) return "";
-    return payload[off .. off + clen - 1];
-}
+// ── ShapeType ─────────────────────────────────────────────────────────────────
+// CDR serialization/deserialization and key-hash computation live in the vendor
+// module (dds_impl.zig for zzdds) so each vendor can handle type support in
+// whatever way suits them — generated code, hand-coded, or otherwise.
+// shape_main.zig only knows about dds.ShapeType and calls dds.serializeShape /
+// dds.deserializeShape / dds.serializeShapeKeyOnly / dds.deserializeShapeKey.
 
 // ── Policy name mapping ───────────────────────────────────────────────────────
 
@@ -564,12 +351,12 @@ fn runPublisher(
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(alloc);
 
-    var shape = ShapeData{
+    var shape = dds.ShapeType{
         .color = color,
         .x = 0,
         .y = 0,
         .shapesize = if (opts.shapesize == 0) 1 else opts.shapesize,
-        .payload = opts.additional_payload,
+        .additional_payload = opts.additional_payload,
     };
     var rng = std.Random.DefaultPrng.init(@intCast(monoNs()));
     const rand = rng.random();
@@ -615,9 +402,9 @@ fn runPublisher(
             defer if (inst > 0) alloc.free(inst_color);
 
             shape.color = inst_color;
-            try serializeShape(&buf, alloc, shape, opts.data_representation == 2);
+            try dds.serializeShape(&buf, alloc, shape, opts.data_representation == 2);
 
-            const key_hash = colorKeyHash(inst_color);
+            const key_hash = dds.shapeKeyHash(inst_color);
             try dds.writeRaw(dw, .alive, key_hash, buf.items);
 
             if (opts.print_writer_samples) {
@@ -650,8 +437,8 @@ fn runPublisher(
                 break :blk std.fmt.allocPrint(alloc, "{s}{d}", .{ color, inst }) catch color;
             };
             defer if (inst > 0) alloc.free(inst_color);
-            const key_hash = colorKeyHash(inst_color);
-            try serializeShapeKeyOnly(&buf, alloc, inst_color);
+            const key_hash = dds.shapeKeyHash(inst_color);
+            try dds.serializeShapeKeyOnly(&buf, alloc, inst_color);
             dds.writeRaw(dw, kind, key_hash, buf.items) catch {};
         }
         // Brief drain to let RELIABLE transport deliver the NOT_ALIVE changes before
@@ -746,7 +533,7 @@ fn runSubscriber(
     var deadline_base_ns: i64 = 0;
 
     const ShapeAccessor = struct {
-        shape: *const ParsedShape,
+        shape: *const dds.ShapeType,
 
         fn get(ctx: *anyopaque, field: []const u8) ?dds.FilterValue {
             const self: *const @This() = @ptrCast(@alignCast(ctx));
@@ -778,7 +565,7 @@ fn runSubscriber(
             if (taken.instance_state == DDS.NOT_ALIVE_NO_WRITERS_INSTANCE_STATE or
                 taken.instance_state == DDS.NOT_ALIVE_DISPOSED_INSTANCE_STATE)
             {
-                const key = deserializeShapeKey(taken.data);
+                const key = dds.deserializeShapeKey(taken.data);
                 const state_str = if (taken.instance_state == DDS.NOT_ALIVE_DISPOSED_INSTANCE_STATE)
                     "NOT_ALIVE_DISPOSED_INSTANCE_STATE"
                 else
@@ -787,7 +574,7 @@ fn runSubscriber(
                 continue;
             }
 
-            const s = deserializeShape(taken.data) orelse continue;
+            const s = dds.deserializeShape(taken.data) orelse continue;
 
             if (cft) |c| {
                 var acc_ctx = ShapeAccessor{ .shape = &s };
@@ -1024,7 +811,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     defer dds.destroyParticipant(participant);
     const dp = participant.toDDS();
 
-    dds.registerTypeSupport(dp, "ShapeType", .{ .compute_key_hash = shapeTypeKeyHash });
+    dds.registerTypeSupport(dp, "ShapeType", .{ .compute_key_hash = dds.shapeKeyHashFromCdr });
 
     const topic = dp.vtable.create_topic(
         dp.ptr,
