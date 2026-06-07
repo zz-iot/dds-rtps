@@ -100,8 +100,9 @@ const Options = struct {
     access_scope: u8 = 'i', // 'i'=instance (default), 't'=topic, 'g'=group (--access-scope)
     ordered_access: bool = false, // --ordered
     coherent_access: bool = false, // --coherent
-    num_topics: u32 = 1, // --num-topics (>1 not supported)
-    take_read: bool = false, // --take-read (not supported)
+    num_topics: u32 = 1, // --num-topics
+    take_read: bool = false, // --take-read: use take() instead of take_next_instance()
+    coherent_sample_count: u32 = 0, // --coherent-sample-count (0 = no coherent set gating)
 };
 
 // ── ShapeType ─────────────────────────────────────────────────────────────────
@@ -304,16 +305,64 @@ fn isNilCft(cft: DDS.ContentFilteredTopic) bool {
     return dds.isNilCft(cft);
 }
 
+// ── Multi-topic helpers ───────────────────────────────────────────────────────
+
+const MAX_TOPICS = 16;
+
+// Holds the extra topics (index 1..num_topics-1) created alongside the base topic.
+// The base topic (index 0) is owned by main() and its name is opts.topic_name.
+const ExtraTopics = struct {
+    topics: [MAX_TOPICS]DDS.Topic = undefined,
+    names: [MAX_TOPICS][]u8 = undefined,
+    count: u32 = 0,
+
+    fn deinitNames(self: *ExtraTopics, alloc: std.mem.Allocator) void {
+        for (0..self.count) |i| alloc.free(self.names[i]);
+    }
+
+    fn topicAt(self: *const ExtraTopics, base: DDS.Topic, i: u32) DDS.Topic {
+        return if (i == 0) base else self.topics[i - 1];
+    }
+
+    fn nameAt(self: *const ExtraTopics, base_name: []const u8, i: u32) []const u8 {
+        return if (i == 0) base_name else self.names[i - 1];
+    }
+};
+
+fn createExtraTopics(
+    alloc: std.mem.Allocator,
+    dp: DDS.DomainParticipant,
+    opts: *const Options,
+) !ExtraTopics {
+    var et = ExtraTopics{};
+    et.count = opts.num_topics - 1;
+    for (0..et.count) |i| {
+        et.names[i] = try std.fmt.allocPrint(alloc, "{s}{d}", .{ opts.topic_name, i + 1 });
+        stdoutPrint("Create topic: {s}\n", .{et.names[i]});
+        et.topics[i] = dp.vtable.create_topic(dp.ptr, et.names[i], "ShapeType", .{}, dds.nilTopicListener(), 0);
+        if (isNilTopic(et.topics[i])) {
+            // Free names allocated so far then signal failure
+            for (0..i + 1) |j| alloc.free(et.names[j]);
+            et.count = 0;
+            return error.TopicFailed;
+        }
+    }
+    return et;
+}
+
 // ── Publisher ─────────────────────────────────────────────────────────────────
 
 fn runPublisher(
     alloc: std.mem.Allocator,
     dp: DDS.DomainParticipant,
-    topic: DDS.Topic,
+    base_topic: DDS.Topic,
     opts: *const Options,
 ) !void {
-    const color = opts.color orelse "BLUE";
-    const topic_name = dds.topicName(topic);
+    const base_color = opts.color orelse "BLUE";
+    const n = opts.num_topics;
+
+    var et = try createExtraTopics(alloc, dp, opts);
+    defer et.deinitNames(alloc);
 
     const pub_presentation = DDS.PresentationQosPolicy{
         .access_scope = switch (opts.access_scope) {
@@ -335,29 +384,32 @@ fn runPublisher(
     var dw_qos = try buildWriterQos(alloc, opts);
     defer dw_qos.data_representation.value.deinit(alloc);
 
-    var lctx = ListenerCtx{ .topic_name = topic_name };
-    const dw_listener = DDS.DataWriterListener{
-        .ptr = &lctx,
-        .vtable = &dw_vtable,
-    };
+    // One ListenerCtx and DataWriter per topic.
+    var lctxs: [MAX_TOPICS]ListenerCtx = undefined;
+    var writers: [MAX_TOPICS]DDS.DataWriter = undefined;
     const listener_mask: DDS.StatusMask =
         DDS.OFFERED_INCOMPATIBLE_QOS_STATUS | DDS.OFFERED_DEADLINE_MISSED_STATUS;
 
-    const dw = pub_.vtable.create_datawriter(pub_.ptr, topic, dw_qos, dw_listener, listener_mask);
-    if (isNilDw(dw)) return error.DataWriterFailed;
-
-    stdoutPrint("Create writer for topic: {s} color: {s}\n", .{ topic_name, color });
+    for (0..n) |i| {
+        const tn = et.nameAt(opts.topic_name, @intCast(i));
+        lctxs[i] = .{ .topic_name = tn };
+        const dw_listener = DDS.DataWriterListener{ .ptr = &lctxs[i], .vtable = &dw_vtable };
+        const t = et.topicAt(base_topic, @intCast(i));
+        writers[i] = pub_.vtable.create_datawriter(pub_.ptr, t, dw_qos, dw_listener, listener_mask);
+        if (isNilDw(writers[i])) return error.DataWriterFailed;
+        stdoutPrint("Create writer for topic: {s} color: {s}\n", .{ tn, base_color });
+    }
 
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(alloc);
 
     var shape = dds.ShapeType{
-        .color = color,
         .x = 0,
         .y = 0,
         .shapesize = if (opts.shapesize == 0) 1 else opts.shapesize,
         .additional_payload = opts.additional_payload,
     };
+    shape.setColor(base_color);
     var rng = std.Random.DefaultPrng.init(@intCast(monoNs()));
     const rand = rng.random();
 
@@ -370,15 +422,22 @@ fn runPublisher(
         0;
     var last_write_ns: i64 = monoNs();
 
+    // Coherent set gating: begin/end coherent_changes every coherent_sample_count iterations.
+    // When coherent_access is enabled but no explicit count given (sc=0), default to 1 so
+    // that every outer write-loop iteration is its own coherent set.  This ensures
+    // PID_COHERENT_SET is emitted even for single-sample sets (required by Connext).
+    const sc: u32 = if (opts.coherent_sample_count > 0) opts.coherent_sample_count else 1;
+    const use_coherent_gating = opts.coherent_access or opts.ordered_access;
+
     var iteration: i64 = 0;
     while (!g_all_done.load(.acquire)) {
         if (opts.num_iterations >= 0 and iteration >= opts.num_iterations) break;
 
         if (!printed_matched) {
-            if (dds.writerMatchedCount(dw) > 0) {
+            if (dds.writerMatchedCount(writers[0]) > 0) {
                 stdoutPrint(
                     "on_publication_matched() topic: '{s}'  type: 'ShapeType' : matched readers {d} (change = 1)\n",
-                    .{ topic_name, dds.writerMatchedCount(dw) },
+                    .{ lctxs[0].topic_name, dds.writerMatchedCount(writers[0]) },
                 );
                 printed_matched = true;
             } else if (monoNs() > match_deadline) {
@@ -388,27 +447,42 @@ fn runPublisher(
 
         if (deadline_ns > 0) {
             const elapsed = monoNs() - last_write_ns;
-            if (elapsed > deadline_ns) dds.writerNotifyDeadline(dw);
+            if (elapsed > deadline_ns) dds.writerNotifyDeadline(writers[0]);
         }
 
         shape.x = @rem(@as(i32, rand.int(u16)), 320);
         shape.y = @rem(@as(i32, rand.int(u16)), 240);
 
-        for (0..opts.num_instances) |inst| {
-            const inst_color: []const u8 = blk: {
-                if (inst == 0) break :blk color;
-                break :blk std.fmt.allocPrint(alloc, "{s}{d}", .{ color, inst }) catch color;
-            };
-            defer if (inst > 0) alloc.free(inst_color);
+        if (use_coherent_gating) {
+            const iter_mod = @as(u32, @intCast(@mod(iteration, @as(i64, sc))));
+            if (iter_mod == 0) _ = pub_.vtable.begin_coherent_changes(pub_.ptr);
 
-            shape.color = inst_color;
-            try dds.serializeShape(&buf, alloc, shape, opts.data_representation == 2);
+            for (0..n) |ti| {
+                for (0..opts.num_instances) |inst| {
+                    const inst_color = try instanceColor(alloc, base_color, inst);
+                    defer if (inst > 0) alloc.free(inst_color);
+                    shape.setColor(inst_color);
+                    try dds.serializeShape(&buf, alloc, shape, opts.data_representation == 2);
+                    try dds.writeRaw(writers[ti], .alive, dds.shapeKeyHash(inst_color), buf.items);
+                    if (opts.print_writer_samples) {
+                        stdoutPrint("{s:<10} {s:<10} {d:0>3} {d:0>3} [{d}]\n", .{ lctxs[ti].topic_name, inst_color, @as(u32, @intCast(shape.x)), @as(u32, @intCast(shape.y)), shape.shapesize });
+                    }
+                }
+            }
 
-            const key_hash = dds.shapeKeyHash(inst_color);
-            try dds.writeRaw(dw, .alive, key_hash, buf.items);
-
-            if (opts.print_writer_samples) {
-                stdoutPrint("{s:<10} {s:<10} {d:0>3} {d:0>3} [{d}]\n", .{ topic_name, inst_color, @as(u32, @intCast(shape.x)), @as(u32, @intCast(shape.y)), shape.shapesize });
+            if (iter_mod == sc - 1) _ = pub_.vtable.end_coherent_changes(pub_.ptr);
+        } else {
+            for (0..n) |ti| {
+                for (0..opts.num_instances) |inst| {
+                    const inst_color = try instanceColor(alloc, base_color, inst);
+                    defer if (inst > 0) alloc.free(inst_color);
+                    shape.setColor(inst_color);
+                    try dds.serializeShape(&buf, alloc, shape, opts.data_representation == 2);
+                    try dds.writeRaw(writers[ti], .alive, dds.shapeKeyHash(inst_color), buf.items);
+                    if (opts.print_writer_samples) {
+                        stdoutPrint("{s:<10} {s:<10} {d:0>3} {d:0>3} [{d}]\n", .{ lctxs[ti].topic_name, inst_color, @as(u32, @intCast(shape.x)), @as(u32, @intCast(shape.y)), shape.shapesize });
+                    }
+                }
             }
         }
 
@@ -423,26 +497,22 @@ fn runPublisher(
         sleepNs(opts.write_period_ms * std.time.ns_per_ms);
     }
 
-    // Unregister/dispose all instances when the publisher exits with a finite num_iterations.
-    // For explicit --final-instance-state, use the requested kind; otherwise default to .unregister
-    // so that DataReader instances transition to NOT_ALIVE_NO_WRITERS (DDS spec §2.2.2.4.1.13).
+    // Unregister/dispose all instances across all topics on finite run.
     if (opts.num_iterations >= 0) {
         const kind: dds.WriteKind = switch (opts.final_instance_state) {
             'd' => .dispose,
             else => .unregister,
         };
-        for (0..opts.num_instances) |inst| {
-            const inst_color: []const u8 = blk: {
-                if (inst == 0) break :blk color;
-                break :blk std.fmt.allocPrint(alloc, "{s}{d}", .{ color, inst }) catch color;
-            };
-            defer if (inst > 0) alloc.free(inst_color);
-            const key_hash = dds.shapeKeyHash(inst_color);
-            try dds.serializeShapeKeyOnly(&buf, alloc, inst_color);
-            dds.writeRaw(dw, kind, key_hash, buf.items) catch {};
+        for (0..n) |ti| {
+            for (0..opts.num_instances) |inst| {
+                const inst_color = try instanceColor(alloc, base_color, inst);
+                defer if (inst > 0) alloc.free(inst_color);
+                const key_hash = dds.shapeKeyHash(inst_color);
+                try dds.serializeShapeKeyOnly(&buf, alloc, inst_color, opts.data_representation == 2);
+                dds.writeRaw(writers[ti], kind, key_hash, buf.items) catch {};
+            }
         }
-        // Brief drain to let RELIABLE transport deliver the NOT_ALIVE changes before
-        // the participant is torn down.
+        // Brief drain to let RELIABLE transport deliver the NOT_ALIVE changes.
         sleepNs(300 * std.time.ns_per_ms);
     }
 }
@@ -452,12 +522,15 @@ fn runPublisher(
 fn runSubscriber(
     alloc: std.mem.Allocator,
     dp: DDS.DomainParticipant,
-    topic: DDS.Topic,
+    base_topic: DDS.Topic,
     opts: *const Options,
 ) !void {
-    const topic_name = dds.topicName(topic);
+    const n = opts.num_topics;
 
-    // When -c COLOR is passed to a subscriber without --cft, synthesize a color filter.
+    var et = try createExtraTopics(alloc, dp, opts);
+    defer et.deinitNames(alloc);
+
+    // Content-filtered topic for topic[0] only (when --cft or -c COLOR is specified).
     var synth_cft_buf: [64]u8 = undefined;
     const effective_cft_expr: ?[]const u8 = if (opts.cft_expression) |e|
         e
@@ -468,30 +541,16 @@ fn runSubscriber(
 
     const cft: ?DDS.ContentFilteredTopic = blk: {
         const expr = effective_cft_expr orelse break :blk null;
-        const cft_name = std.fmt.allocPrint(
-            alloc,
-            "{s}_cft",
-            .{topic_name},
-        ) catch break :blk null;
+        const base_name = et.nameAt(opts.topic_name, 0);
+        const cft_name = std.fmt.allocPrint(alloc, "{s}_cft", .{base_name}) catch break :blk null;
         defer alloc.free(cft_name);
-        const c = dp.vtable.create_contentfilteredtopic(
-            dp.ptr,
-            cft_name,
-            topic,
-            expr,
-            .empty,
-        );
+        const c = dp.vtable.create_contentfilteredtopic(dp.ptr, cft_name, base_topic, expr, .empty);
         if (isNilCft(c)) break :blk null;
         break :blk c;
     };
     defer {
         if (cft) |c| _ = dp.vtable.delete_contentfilteredtopic(dp.ptr, c);
     }
-
-    const topic_desc: DDS.TopicDescription = if (cft) |c|
-        dds.cftTopicDescription(c)
-    else
-        dp.vtable.lookup_topicdescription(dp.ptr, dds.topicName(topic));
 
     const sub_presentation = DDS.PresentationQosPolicy{
         .access_scope = switch (opts.access_scope) {
@@ -513,18 +572,26 @@ fn runSubscriber(
     var dr_qos = try buildReaderQos(alloc, opts);
     defer dr_qos.data_representation.value.deinit(alloc);
 
-    var lctx = ListenerCtx{ .topic_name = topic_name };
-    const dr_listener = DDS.DataReaderListener{
-        .ptr = &lctx,
-        .vtable = &dr_vtable,
-    };
+    // One ListenerCtx and DataReader per topic.
+    var lctxs: [MAX_TOPICS]ListenerCtx = undefined;
+    var readers: [MAX_TOPICS]DDS.DataReader = undefined;
     const listener_mask: DDS.StatusMask =
         DDS.REQUESTED_INCOMPATIBLE_QOS_STATUS | DDS.REQUESTED_DEADLINE_MISSED_STATUS;
 
-    const dr = sub.vtable.create_datareader(sub.ptr, topic_desc, dr_qos, dr_listener, listener_mask);
-    if (isNilDr(dr)) return error.DataReaderFailed;
+    for (0..n) |i| {
+        const tn = et.nameAt(opts.topic_name, @intCast(i));
+        lctxs[i] = .{ .topic_name = tn };
+        const dr_listener = DDS.DataReaderListener{ .ptr = &lctxs[i], .vtable = &dr_vtable };
 
-    stdoutPrint("Create reader for topic: {s}\n", .{topic_name});
+        const topic_desc: DDS.TopicDescription = if (i == 0 and cft != null)
+            dds.cftTopicDescription(cft.?)
+        else
+            dp.vtable.lookup_topicdescription(dp.ptr, tn);
+
+        stdoutPrint("Create reader for topic: {s}\n", .{tn});
+        readers[i] = sub.vtable.create_datareader(sub.ptr, topic_desc, dr_qos, dr_listener, listener_mask);
+        if (isNilDr(readers[i])) return error.DataReaderFailed;
+    }
 
     const sub_deadline_ns: i64 = if (opts.deadline_ms > 0)
         @intCast(opts.deadline_ms * std.time.ns_per_ms)
@@ -538,7 +605,7 @@ fn runSubscriber(
         fn get(ctx: *anyopaque, field: []const u8) ?dds.FilterValue {
             const self: *const @This() = @ptrCast(@alignCast(ctx));
             if (std.mem.eql(u8, field, "color"))
-                return .{ .string = self.shape.color };
+                return .{ .string = self.shape.color.slice() };
             if (std.mem.eql(u8, field, "x"))
                 return .{ .int = self.shape.x };
             if (std.mem.eql(u8, field, "y"))
@@ -549,54 +616,83 @@ fn runSubscriber(
         }
     };
 
+    const use_access = opts.coherent_access or opts.ordered_access;
+
+    // Maps instance_handle → color for recovering key identity from NOT_ALIVE samples
+    // that arrive without a serialized key payload (e.g. Connext D=0,K=0 with PID_KEY_HASH only).
+    var ih_to_color = std.AutoHashMap(i32, dds.ShapeColor).init(alloc);
+    defer ih_to_color.deinit();
+
     var iteration: i64 = 0;
     while (!g_all_done.load(.acquire)) {
         if (opts.num_iterations >= 0 and iteration >= opts.num_iterations) break;
 
-        if (sub_deadline_ns > 0 and deadline_base_ns == 0 and dds.readerMatchedCount(dr) > 0) {
+        if (sub_deadline_ns > 0 and deadline_base_ns == 0 and dds.readerMatchedCount(readers[0]) > 0) {
             deadline_base_ns = monoNs();
         }
 
+        // Begin access window for GROUP/TOPIC_PRESENTATION coherent or ordered access.
+        if (use_access) {
+            if (opts.coherent_access)
+                stdoutPrint("Reading coherent sets, iteration {d}\n", .{iteration});
+            if (opts.ordered_access)
+                stdoutPrint("Reading with ordered access, iteration {d}\n", .{iteration});
+            _ = sub.vtable.begin_access(sub.ptr);
+        }
+
         var got_data = false;
-        while (dds.takeRaw(dr)) |taken| {
-            defer taken.deinit();
-            got_data = true;
+        for (0..n) |ti| {
+            const tn = lctxs[ti].topic_name;
+            while (dds.takeRaw(readers[ti])) |taken| {
+                defer taken.deinit();
+                got_data = true;
 
-            if (taken.instance_state == DDS.NOT_ALIVE_NO_WRITERS_INSTANCE_STATE or
-                taken.instance_state == DDS.NOT_ALIVE_DISPOSED_INSTANCE_STATE)
-            {
-                const key = dds.deserializeShapeKey(taken.data);
-                const state_str = if (taken.instance_state == DDS.NOT_ALIVE_DISPOSED_INSTANCE_STATE)
-                    "NOT_ALIVE_DISPOSED_INSTANCE_STATE"
-                else
-                    "NOT_ALIVE_NO_WRITERS_INSTANCE_STATE";
-                stdoutPrint("{s:<10} {s:<10} {s}\n", .{ topic_name, key, state_str });
-                continue;
-            }
+                if (taken.instance_state == DDS.NOT_ALIVE_NO_WRITERS_INSTANCE_STATE or
+                    taken.instance_state == DDS.NOT_ALIVE_DISPOSED_INSTANCE_STATE)
+                {
+                    var key = dds.deserializeShapeKey(taken.data);
+                    if (key.slice().len == 0) {
+                        if (ih_to_color.get(taken.instance_handle)) |cached| key = cached;
+                    }
+                    const state_str = if (taken.instance_state == DDS.NOT_ALIVE_DISPOSED_INSTANCE_STATE)
+                        "NOT_ALIVE_DISPOSED_INSTANCE_STATE"
+                    else
+                        "NOT_ALIVE_NO_WRITERS_INSTANCE_STATE";
+                    stdoutPrint("{s:<10} {s:<10} {s}\n", .{ tn, key.slice(), state_str });
+                    continue;
+                }
 
-            const s = dds.deserializeShape(taken.data) orelse continue;
+                const s = dds.deserializeShape(taken.data, alloc) orelse continue;
 
-            if (cft) |c| {
-                var acc_ctx = ShapeAccessor{ .shape = &s };
-                const accessor = dds.FieldAccessor{
-                    .ctx = &acc_ctx,
-                    .get = ShapeAccessor.get,
-                };
-                if (!dds.cftMatchSample(c, accessor)) continue;
-            }
+                ih_to_color.put(taken.instance_handle, s.color) catch {};
 
-            if (s.last_payload_byte) |lb| {
-                stdoutPrint("{s:<10} {s:<10} {d:0>3} {d:0>3} [{d}] {{{d}}}\n", .{ topic_name, s.color, @as(u32, @intCast(s.x)), @as(u32, @intCast(s.y)), s.shapesize, lb });
-            } else {
-                stdoutPrint("{s:<10} {s:<10} {d:0>3} {d:0>3} [{d}]\n", .{ topic_name, s.color, @as(u32, @intCast(s.x)), @as(u32, @intCast(s.y)), s.shapesize });
+                // CFT post-filter (only for topic[0] when CFT is active).
+                if (ti == 0) {
+                    if (cft) |c| {
+                        var acc_ctx = ShapeAccessor{ .shape = &s };
+                        const accessor = dds.FieldAccessor{
+                            .ctx = &acc_ctx,
+                            .get = ShapeAccessor.get,
+                        };
+                        if (!dds.cftMatchSample(c, accessor)) continue;
+                    }
+                }
+
+                if (s.last_payload_byte) |lb| {
+                    stdoutPrint("{s:<10} {s:<10} {d:0>3} {d:0>3} [{d}] {{{d}}}\n", .{ tn, s.color.slice(), @as(u32, @intCast(s.x)), @as(u32, @intCast(s.y)), s.shapesize, lb });
+                } else {
+                    stdoutPrint("{s:<10} {s:<10} {d:0>3} {d:0>3} [{d}]\n", .{ tn, s.color.slice(), @as(u32, @intCast(s.x)), @as(u32, @intCast(s.y)), s.shapesize });
+                }
             }
         }
+
+        if (use_access) _ = sub.vtable.end_access(sub.ptr);
 
         if (got_data) {
             deadline_base_ns = monoNs();
         } else if (sub_deadline_ns > 0 and deadline_base_ns != 0) {
             if (monoNs() - deadline_base_ns > sub_deadline_ns) {
-                dds.readerNotifyDeadline(dr);
+                dds.readerNotifyDeadline(readers[0]);
                 deadline_base_ns = monoNs();
             }
         }
@@ -604,6 +700,15 @@ fn runSubscriber(
         iteration += 1;
         sleepNs(opts.read_period_ms * std.time.ns_per_ms);
     }
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+// Returns color for instance index: inst=0 → base_color, inst>0 → "{base_color}{inst}".
+// Caller must free the returned slice when inst > 0.
+fn instanceColor(alloc: std.mem.Allocator, base: []const u8, inst: usize) ![]const u8 {
+    if (inst == 0) return base;
+    return std.fmt.allocPrint(alloc, "{s}{d}", .{ base, inst });
 }
 
 // ── Argument parsing ──────────────────────────────────────────────────────────
@@ -700,11 +805,13 @@ fn parseArgs(process_args: std.process.Args) !Options {
             opts.num_topics = std.fmt.parseInt(u32, v, 10) catch 1;
         } else if (std.mem.eql(u8, arg, "--take-read")) {
             opts.take_read = true;
+        } else if (std.mem.eql(u8, arg, "--coherent-sample-count")) {
+            const v = it.next() orelse return error.MissingValue;
+            opts.coherent_sample_count = std.fmt.parseInt(u32, v, 10) catch 0;
         } else if (std.mem.eql(u8, arg, "--publisher-matches") or
             std.mem.eql(u8, arg, "--subscriber-matches") or
             std.mem.eql(u8, arg, "--deadline") or
-            std.mem.eql(u8, arg, "--periodic-announcement") or
-            std.mem.eql(u8, arg, "--coherent-sample-count"))
+            std.mem.eql(u8, arg, "--periodic-announcement"))
         {
             // consume argument value and ignore — unimplemented options
             _ = it.next();
@@ -731,6 +838,7 @@ fn parseArgs(process_args: std.process.Args) !Options {
                 \\  -c <color>          Color / key value (default: BLUE)
                 \\  -z <size>           Shape size; 0 = auto-increment each sample (default: 20)
                 \\  -n <count>          Number of instances to publish (default: 1)
+                \\  --num-topics <n>    Number of topics (Square, Square1, Square2, ...) (default: 1)
                 \\  --additional-payload <bytes>  Extra zero bytes appended to each sample
                 \\  --size-modulo <n>   Cycle shapesize 1..n when -z 0 is active
                 \\  --cft <expr>        Content filter expression (subscriber only)
@@ -740,6 +848,13 @@ fn parseArgs(process_args: std.process.Args) !Options {
                 \\  --write-period <ms>         Publish interval in ms (default: 33)
                 \\  --read-period <ms>          Read poll interval in ms (default: 100)
                 \\
+                \\Presentation / coherent:
+                \\  --access-scope i|t|g        Presentation access scope (default: i)
+                \\  --ordered                   Enable ordered access
+                \\  --coherent                  Enable coherent access
+                \\  --coherent-sample-count <n> Samples per coherent set (0 = no gating)
+                \\  --take-read                 Use take() instead of take_next_instance()
+                \\
                 \\Other:
                 \\  -d <id>             Domain ID (default: 0)
                 \\  -w                  Print each sample on the writer side
@@ -747,8 +862,6 @@ fn parseArgs(process_args: std.process.Args) !Options {
                 \\
                 \\Environment variables:
                 \\  SHAPE_STARTUP_DELAY_MS=<ms>   Sleep before creating the DDS participant.
-                \\                                Useful for late-join testing without relying
-                \\                                on fixed sleeps in the test harness.
                 \\
             );
             std.process.exit(0);
@@ -794,16 +907,6 @@ pub fn main(init: std.process.Init.Minimal) !void {
         std.process.exit(1);
     }
 
-    // Signal unsupported features to the test harness so it marks them as vendor-skipped.
-    if (opts.num_topics > 1) {
-        stdoutPrint("not supported: --num-topics > 1\n", .{});
-        return;
-    }
-    if (opts.take_read) {
-        stdoutPrint("not supported: --take-read\n", .{});
-        return;
-    }
-
     const participant = dds.createParticipant(alloc, opts.domain_id) catch |err| {
         std.log.err("failed to create participant on domain {d}: {}", .{ opts.domain_id, err });
         std.process.exit(1);
@@ -813,7 +916,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
     dds.registerTypeSupport(dp, "ShapeType", .{ .compute_key_hash = dds.shapeKeyHashFromCdr });
 
-    const topic = dp.vtable.create_topic(
+    // Create the base topic (index 0). Additional topics are created inside run functions.
+    const base_topic = dp.vtable.create_topic(
         dp.ptr,
         opts.topic_name,
         "ShapeType",
@@ -821,7 +925,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         dds.nilTopicListener(),
         0,
     );
-    if (isNilTopic(topic)) {
+    if (isNilTopic(base_topic)) {
         std.log.err("failed to create topic '{s}'", .{opts.topic_name});
         std.process.exit(1);
     }
@@ -829,12 +933,12 @@ pub fn main(init: std.process.Init.Minimal) !void {
     stdoutPrint("Create topic: {s}\n", .{opts.topic_name});
 
     if (opts.publish) {
-        runPublisher(alloc, dp, topic, &opts) catch |err| {
+        runPublisher(alloc, dp, base_topic, &opts) catch |err| {
             std.log.err("publisher error: {}", .{err});
             std.process.exit(1);
         };
     } else {
-        runSubscriber(alloc, dp, topic, &opts) catch |err| {
+        runSubscriber(alloc, dp, base_topic, &opts) catch |err| {
             std.log.err("subscriber error: {}", .{err});
             std.process.exit(1);
         };
