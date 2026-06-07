@@ -126,6 +126,7 @@ pub const TakenSample = struct {
     data: []u8,
     alloc: std.mem.Allocator,
     instance_state: DDS.InstanceStateKind,
+    instance_handle: DDS.InstanceHandle_t,
 
     pub fn deinit(self: TakenSample) void {
         self.alloc.free(self.data);
@@ -139,6 +140,7 @@ pub fn takeRaw(dr: DDS.DataReader) ?TakenSample {
         .data = taken.data,
         .alloc = impl.alloc,
         .instance_state = taken.info.instance_state,
+        .instance_handle = taken.info.instance_handle,
     };
 }
 
@@ -188,16 +190,20 @@ pub fn registerTypeSupport(
 const shape_gen = @import("shape_gen");
 const zidl_rt = @import("zidl_rt");
 
-/// Wrapper type for shape_main.zig.  Keeps a borrowed `color` slice (valid
-/// while the source payload is alive) and separates the publisher-side
-/// `additional_payload` size from the subscriber-side `last_payload_byte`.
+/// View type for shape_main.zig.  Owns `color` as inline bounded storage and
+/// separates the publisher-side `additional_payload` size from the
+/// subscriber-side `last_payload_byte`.
 pub const ShapeType = struct {
-    color: []const u8,
+    color: zidl_rt.BoundedArray(u8, 128) = .{},
     x: i32 = 0,
     y: i32 = 0,
     shapesize: i32 = 20,
     additional_payload: u32 = 0,
     last_payload_byte: ?u8 = null,
+
+    pub fn setColor(self: *@This(), c: []const u8) void {
+        self.color = zidl_rt.BoundedArray(u8, 128).fromSlice(c) catch .{};
+    }
 };
 
 /// Serialize shape into `buf` (cleared first) using zidl-generated CDR.
@@ -208,9 +214,8 @@ pub fn serializeShape(
     s: ShapeType,
     xcdr2: bool,
 ) !void {
-    // Build a temporary generated ShapeType for the serializer.
     var shape: shape_gen.ShapeType = .{
-        .color = zidl_rt.BoundedArray(u8, 128).fromSlice(s.color) catch return error.ColorTooLong,
+        .color = s.color,
         .x = s.x,
         .y = s.y,
         .shapesize = s.shapesize,
@@ -235,54 +240,59 @@ pub fn serializeShape(
     }
 }
 
-/// Serialize a key-only CDR payload (XCDR1) for dispose/unregister writes.
+/// Serialize a key-only CDR payload for dispose/unregister writes.
 pub fn serializeShapeKeyOnly(
     buf: *std.ArrayList(u8),
     alloc: std.mem.Allocator,
     color: []const u8,
+    xcdr2: bool,
 ) !void {
     const shape = shape_gen.ShapeType{
         .color = zidl_rt.BoundedArray(u8, 128).fromSlice(color) catch return error.ColorTooLong,
     };
     buf.clearRetainingCapacity();
-    var w = zidl_rt.CdrWriter(.xcdr1).init(buf, alloc);
-    try w.writeEncapHeader();
-    try shape_gen.ShapeType.serializeKey(&w, shape);
+    if (xcdr2) {
+        var w = zidl_rt.CdrWriter(.xcdr2).init(buf, alloc);
+        try w.writeEncapHeader();
+        try shape_gen.ShapeType.serializeKey(&w, shape);
+    } else {
+        var w = zidl_rt.CdrWriter(.xcdr1).init(buf, alloc);
+        try w.writeEncapHeader();
+        try shape_gen.ShapeType.serializeKey(&w, shape);
+    }
 }
 
 /// Deserialize a CDR/CDR2 ShapeType payload.  Returns null on parse error or
-/// if the payload is key-only (missing x/y/shapesize).  The returned color
-/// slice is zero-copied from `payload` and is valid only while `payload` lives.
-pub fn deserializeShape(payload: []const u8) ?ShapeType {
+/// if the payload is key-only (missing x/y/shapesize).
+pub fn deserializeShape(payload: []const u8, alloc: std.mem.Allocator) ?ShapeType {
     var reader = zidl_rt.CdrReader.init(payload) catch return null;
-    reader.skipDheaderIfXcdr2() catch return null;
-    const color = reader.readStringZeroCopy() catch return null;
-    if (color.len > 128) return null;
-    const x = reader.readI32() catch return null;
-    const y = reader.readI32() catch return null;
-    const shapesize = reader.readI32() catch return null;
-    const extra_len = reader.readU32() catch 0;
-    var last_byte: ?u8 = null;
-    if (extra_len > 0) {
-        reader.skip(extra_len - 1) catch {};
-        last_byte = reader.readU8() catch null;
-    }
+    var gen = shape_gen.ShapeType.deserialize(&reader, alloc) catch return null;
+    defer gen.additional_payload_size.deinit(alloc);
+    const extra_len: u32 = @intCast(gen.additional_payload_size.items.len);
+    const last_byte: ?u8 = if (extra_len > 0)
+        gen.additional_payload_size.items[extra_len - 1]
+    else
+        null;
     return .{
-        .color = color,
-        .x = x,
-        .y = y,
-        .shapesize = shapesize,
+        .color = gen.color,
+        .x = gen.x,
+        .y = gen.y,
+        .shapesize = gen.shapesize,
         .additional_payload = extra_len,
         .last_payload_byte = last_byte,
     };
 }
 
-/// Extract the color key string from a CDR payload (full or key-only).
-/// Zero-copied from `payload`; valid only while `payload` is alive.
-pub fn deserializeShapeKey(payload: []const u8) []const u8 {
-    var reader = zidl_rt.CdrReader.init(payload) catch return "";
-    reader.skipDheaderIfXcdr2() catch return "";
-    return reader.readStringZeroCopy() catch "";
+/// The BoundedArray type used for shape color strings.
+pub const ShapeColor = zidl_rt.BoundedArray(u8, 128);
+
+/// Extract the color key from a CDR payload (full or key-only).
+pub fn deserializeShapeKey(payload: []const u8) ShapeColor {
+    var reader = zidl_rt.CdrReader.init(payload) catch return .{};
+    // ShapeType's @key field uses BoundedArray (inline storage); the allocator
+    // parameter of deserializeKey is never called for this type.
+    const gen = shape_gen.ShapeType.deserializeKey(&reader, std.heap.page_allocator) catch return .{};
+    return gen.color;
 }
 
 /// Compute the RTPS key hash for a ShapeType instance from its color string.
@@ -298,7 +308,7 @@ pub fn shapeKeyHash(color: []const u8) [16]u8 {
 /// Compute the RTPS key hash from a received CDR payload.
 /// Suitable for use as TypeSupport.compute_key_hash.
 pub fn shapeKeyHashFromCdr(payload: []const u8) [16]u8 {
-    return shapeKeyHash(deserializeShapeKey(payload));
+    return shapeKeyHash(deserializeShapeKey(payload).slice());
 }
 
 // ── Nil sentinel helpers ──────────────────────────────────────────────────────
