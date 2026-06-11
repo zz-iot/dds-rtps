@@ -81,7 +81,7 @@ const Options = struct {
     history_depth: i32 = -1, // -1 = use default KEEP_LAST 1
     deadline_ms: u64 = 0,
     ownership_strength: i32 = -1, // -1 = SHARED
-    topic_name: []const u8 = "Square",
+    topic_name: [:0]const u8 = "Square",
     color: ?[]const u8 = null,
     partition: ?[]const u8 = null,
     durability: u8 = 'v',
@@ -94,7 +94,7 @@ const Options = struct {
     num_instances: u32 = 1,
     additional_payload: u32 = 0,
     size_modulo: i32 = 0, // 0 = no cycling (--size-modulo)
-    cft_expression: ?[]const u8 = null, // content filter expression (--cft)
+    cft_expression: ?[:0]const u8 = null, // content filter expression (--cft)
     time_filter_ms: u64 = 0, // TIME_BASED_FILTER minimum_separation in ms (--time-filter)
     final_instance_state: u8 = 0, // 0=none, 'u'=unregister, 'd'=dispose (--final-instance-state)
     access_scope: u8 = 'i', // 'i'=instance (default), 't'=topic, 'g'=group (--access-scope)
@@ -132,7 +132,7 @@ fn policyName(id: i32) []const u8 {
 // ── Listener context and vtables ──────────────────────────────────────────────
 
 const ListenerCtx = struct {
-    topic_name: []const u8,
+    topic_name: [:0]const u8,
     type_name: []const u8 = "ShapeType",
 };
 
@@ -281,7 +281,7 @@ const MAX_TOPICS = 16;
 // The base topic (index 0) is owned by main() and its name is opts.topic_name.
 const ExtraTopics = struct {
     topics: [MAX_TOPICS]DDS.Topic = undefined,
-    names: [MAX_TOPICS][]u8 = undefined,
+    names: [MAX_TOPICS][:0]u8 = undefined,
     count: u32 = 0,
 
     fn deinitNames(self: *ExtraTopics, alloc: std.mem.Allocator) void {
@@ -292,7 +292,7 @@ const ExtraTopics = struct {
         return if (i == 0) base else self.topics[i - 1];
     }
 
-    fn nameAt(self: *const ExtraTopics, base_name: []const u8, i: u32) []const u8 {
+    fn nameAt(self: *const ExtraTopics, base_name: [:0]const u8, i: u32) [:0]const u8 {
         return if (i == 0) base_name else self.names[i - 1];
     }
 };
@@ -305,7 +305,7 @@ fn createExtraTopics(
     var et = ExtraTopics{};
     et.count = opts.num_topics - 1;
     for (0..et.count) |i| {
-        et.names[i] = try std.fmt.allocPrint(alloc, "{s}{d}", .{ opts.topic_name, i + 1 });
+        et.names[i] = try std.fmt.allocPrintSentinel(alloc, "{s}{d}", .{ opts.topic_name, i + 1 }, 0);
         stdoutPrint("Create topic: {s}\n", .{et.names[i]});
         et.topics[i] = dp.create_topic(et.names[i], "ShapeType", .{}, null, 0);
         if (isNilTopic(et.topics[i])) {
@@ -507,18 +507,18 @@ fn runSubscriber(
     defer et.deinitNames(alloc);
 
     // Content-filtered topic for topic[0] only (when --cft or -c COLOR is specified).
-    var synth_cft_buf: [64]u8 = undefined;
-    const effective_cft_expr: ?[]const u8 = if (opts.cft_expression) |e|
+    var synth_cft_buf: [65]u8 = undefined;
+    const effective_cft_expr: ?[:0]const u8 = if (opts.cft_expression) |e|
         e
     else if (opts.color) |c|
-        std.fmt.bufPrint(&synth_cft_buf, "color = '{s}'", .{c}) catch null
+        std.fmt.bufPrintZ(&synth_cft_buf, "color = '{s}'", .{c}) catch null
     else
         null;
 
     const cft: ?DDS.ContentFilteredTopic = blk: {
         const expr = effective_cft_expr orelse break :blk null;
         const base_name = et.nameAt(opts.topic_name, 0);
-        const cft_name = std.fmt.allocPrint(alloc, "{s}_cft", .{base_name}) catch break :blk null;
+        const cft_name = std.fmt.allocPrintSentinel(alloc, "{s}_cft", .{base_name}, 0) catch break :blk null;
         defer alloc.free(cft_name);
         const c = dp.create_contentfilteredtopic(cft_name, base_topic, expr, null);
         if (isNilCft(c)) break :blk null;
