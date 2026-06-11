@@ -62,8 +62,8 @@ pub fn createParticipant(alloc: std.mem.Allocator, domain_id: u32) !*Participant
     errdefer factory.deinit();
     const dpf = factory.toDDSFactory();
 
-    const dp = dpf.create_participant(domain_id, .{}, nil.nil_dp_listener, 0);
-    if (dp.ptr == nil.nil_dp_listener.ptr) return error.ParticipantFailed;
+    const dp = dpf.create_participant(domain_id, .{}, null, 0);
+    if (dp.ptr == nil.NIL_PTR) return error.ParticipantFailed;
 
     p.* = .{
         .alloc = alloc,
@@ -221,12 +221,17 @@ pub fn serializeShape(
         .shapesize = s.shapesize,
     };
     if (s.additional_payload > 0) {
-        try shape.additional_payload_size.ensureTotalCapacity(alloc, s.additional_payload);
-        for (0..s.additional_payload - 1) |_|
-            shape.additional_payload_size.appendAssumeCapacity(0);
-        shape.additional_payload_size.appendAssumeCapacity(255);
+        const payload_buf = try alloc.alloc(u8, s.additional_payload);
+        @memset(payload_buf[0 .. s.additional_payload - 1], 0);
+        payload_buf[s.additional_payload - 1] = 255;
+        shape.additional_payload_size = .{
+            ._buffer = payload_buf.ptr,
+            ._length = @intCast(s.additional_payload),
+            ._maximum = @intCast(s.additional_payload),
+            ._release = true,
+        };
     }
-    defer shape.additional_payload_size.deinit(alloc);
+    defer shape.deinit(alloc);
 
     buf.clearRetainingCapacity();
     if (xcdr2) {
@@ -267,10 +272,10 @@ pub fn serializeShapeKeyOnly(
 pub fn deserializeShape(payload: []const u8, alloc: std.mem.Allocator) ?ShapeType {
     var reader = zidl_rt.CdrReader.init(payload) catch return null;
     var gen = shape_gen.ShapeType.deserialize(&reader, alloc) catch return null;
-    defer gen.additional_payload_size.deinit(alloc);
-    const extra_len: u32 = @intCast(gen.additional_payload_size.items.len);
-    const last_byte: ?u8 = if (extra_len > 0)
-        gen.additional_payload_size.items[extra_len - 1]
+    defer gen.deinit(alloc);
+    const extra_len: u32 = gen.additional_payload_size._length;
+    const last_byte: ?u8 = if (extra_len > 0 and gen.additional_payload_size._buffer != null)
+        gen.additional_payload_size._buffer.?[extra_len - 1]
     else
         null;
     return .{
@@ -306,8 +311,8 @@ pub fn shapeKeyHash(color: []const u8) [16]u8 {
 }
 
 /// Compute the RTPS key hash from a received CDR payload.
-/// Suitable for use as TypeSupport.compute_key_hash.
-pub fn shapeKeyHashFromCdr(payload: []const u8) [16]u8 {
+/// Suitable for use as TypeSupport.compute_key_hash (ctx is ignored).
+pub fn shapeKeyHashFromCdr(_: *anyopaque, payload: []const u8) [16]u8 {
     return shapeKeyHash(deserializeShapeKey(payload).slice());
 }
 
@@ -316,38 +321,34 @@ pub fn shapeKeyHashFromCdr(payload: []const u8) [16]u8 {
 // We recover that address from any exported nil constant without needing to
 // re-export NIL_PTR itself.
 
-fn nilPtr() *anyopaque {
-    return zzdds.dcps.nil_topic_listener.ptr;
-}
-
 pub fn nilTopicListener() DDS.TopicListener {
-    return zzdds.dcps.nil_topic_listener;
+    return DDS.noop_TopicListener;
 }
 pub fn nilPublisherListener() DDS.PublisherListener {
-    return zzdds.dcps.nil_pub_listener;
+    return DDS.noop_PublisherListener;
 }
 pub fn nilSubscriberListener() DDS.SubscriberListener {
-    return zzdds.dcps.nil_sub_listener;
+    return DDS.noop_SubscriberListener;
 }
 
 pub fn isNilDp(dp: DDS.DomainParticipant) bool {
-    return dp.ptr == nilPtr();
+    return dp.ptr == zzdds.dcps.NIL_PTR;
 }
 pub fn isNilTopic(t: DDS.Topic) bool {
-    return t.ptr == nilPtr();
+    return t.ptr == zzdds.dcps.NIL_PTR;
 }
 pub fn isNilPub(p: DDS.Publisher) bool {
-    return p.ptr == nilPtr();
+    return p.ptr == zzdds.dcps.NIL_PTR;
 }
 pub fn isNilSub(s: DDS.Subscriber) bool {
-    return s.ptr == nilPtr();
+    return s.ptr == zzdds.dcps.NIL_PTR;
 }
 pub fn isNilDw(dw: DDS.DataWriter) bool {
-    return dw.ptr == nilPtr();
+    return dw.ptr == zzdds.dcps.NIL_PTR;
 }
 pub fn isNilDr(dr: DDS.DataReader) bool {
-    return dr.ptr == nilPtr();
+    return dr.ptr == zzdds.dcps.NIL_PTR;
 }
 pub fn isNilCft(cft: DDS.ContentFilteredTopic) bool {
-    return cft.ptr == nilPtr();
+    return cft.ptr == zzdds.dcps.NIL_PTR;
 }
