@@ -136,59 +136,23 @@ const ListenerCtx = struct {
     type_name: []const u8 = "ShapeType",
 };
 
-// DataWriter listeners
+// DataWriter listener callbacks — plain Zig, no callconv(.c), status by value.
 
-fn dwOnIncompatQos(ctx: *anyopaque, _: DDS.DataWriter, status: DDS.OfferedIncompatibleQosStatus) void {
-    const lc: *ListenerCtx = @ptrCast(@alignCast(ctx));
+fn dwOnIncompatQos(lc: *ListenerCtx, _: DDS.DataWriter, status: DDS.OfferedIncompatibleQosStatus) void {
     stdoutPrint("on_offered_incompatible_qos() topic: '{s}'  type: '{s}' : {d} ({s})\n", .{ lc.topic_name, lc.type_name, status.last_policy_id, policyName(status.last_policy_id) });
 }
-
-fn dwOnDeadlineMissed(ctx: *anyopaque, _: DDS.DataWriter, status: DDS.OfferedDeadlineMissedStatus) void {
-    const lc: *ListenerCtx = @ptrCast(@alignCast(ctx));
+fn dwOnDeadlineMissed(lc: *ListenerCtx, _: DDS.DataWriter, status: DDS.OfferedDeadlineMissedStatus) void {
     stdoutPrint("on_offered_deadline_missed() topic: '{s}'  type: '{s}' : (total = {d}, change = {d})\n", .{ lc.topic_name, lc.type_name, status.total_count, status.total_count_change });
 }
 
-fn dwOnLivelinessLost(_: *anyopaque, _: DDS.DataWriter, _: DDS.LivelinessLostStatus) void {}
-fn dwOnPubMatched(_: *anyopaque, _: DDS.DataWriter, _: DDS.PublicationMatchedStatus) void {}
-fn dwOnDeinit(_: *anyopaque) void {}
+// DataReader listener callbacks — plain Zig, no callconv(.c), status by value.
 
-var dw_vtable = DDS.DataWriterListener.Vtable{
-    .on_offered_deadline_missed = dwOnDeadlineMissed,
-    .on_offered_incompatible_qos = dwOnIncompatQos,
-    .on_liveliness_lost = dwOnLivelinessLost,
-    .on_publication_matched = dwOnPubMatched,
-    .deinit = dwOnDeinit,
-};
-
-// DataReader listeners
-
-fn drOnIncompatQos(ctx: *anyopaque, _: DDS.DataReader, status: DDS.RequestedIncompatibleQosStatus) void {
-    const lc: *ListenerCtx = @ptrCast(@alignCast(ctx));
+fn drOnIncompatQos(lc: *ListenerCtx, _: DDS.DataReader, status: DDS.RequestedIncompatibleQosStatus) void {
     stdoutPrint("on_requested_incompatible_qos() topic: '{s}'  type: '{s}' : {d} ({s})\n", .{ lc.topic_name, lc.type_name, status.last_policy_id, policyName(status.last_policy_id) });
 }
-
-fn drOnDeadlineMissed(ctx: *anyopaque, _: DDS.DataReader, status: DDS.RequestedDeadlineMissedStatus) void {
-    const lc: *ListenerCtx = @ptrCast(@alignCast(ctx));
+fn drOnDeadlineMissed(lc: *ListenerCtx, _: DDS.DataReader, status: DDS.RequestedDeadlineMissedStatus) void {
     stdoutPrint("on_requested_deadline_missed() topic: '{s}'  type: '{s}' : (total = {d}, change = {d})\n", .{ lc.topic_name, lc.type_name, status.total_count, status.total_count_change });
 }
-
-fn drOnSampleRejected(_: *anyopaque, _: DDS.DataReader, _: DDS.SampleRejectedStatus) void {}
-fn drOnLivelinessChanged(_: *anyopaque, _: DDS.DataReader, _: DDS.LivelinessChangedStatus) void {}
-fn drOnDataAvail(_: *anyopaque, _: DDS.DataReader) void {}
-fn drOnSubMatched(_: *anyopaque, _: DDS.DataReader, _: DDS.SubscriptionMatchedStatus) void {}
-fn drOnSampleLost(_: *anyopaque, _: DDS.DataReader, _: DDS.SampleLostStatus) void {}
-fn drOnDeinit(_: *anyopaque) void {}
-
-var dr_vtable = DDS.DataReaderListener.Vtable{
-    .on_requested_deadline_missed = drOnDeadlineMissed,
-    .on_requested_incompatible_qos = drOnIncompatQos,
-    .on_sample_rejected = drOnSampleRejected,
-    .on_liveliness_changed = drOnLivelinessChanged,
-    .on_data_available = drOnDataAvail,
-    .on_subscription_matched = drOnSubMatched,
-    .on_sample_lost = drOnSampleLost,
-    .deinit = drOnDeinit,
-};
 
 // ── DataWriter QoS builder ────────────────────────────────────────────────────
 
@@ -228,7 +192,9 @@ fn buildWriterQos(alloc: std.mem.Allocator, opts: *const Options) !DDS.DataWrite
     };
 
     const repr_id: i16 = if (opts.data_representation == 2) 2 else 0;
-    try qos.data_representation.value.append(alloc, repr_id);
+    const repr_buf = try alloc.alloc(DDS.DataRepresentationId_t, 1);
+    repr_buf[0] = repr_id;
+    qos.data_representation.value = .{ ._buffer = repr_buf.ptr, ._length = 1, ._maximum = 1, ._release = true };
 
     return qos;
 }
@@ -277,7 +243,9 @@ fn buildReaderQos(alloc: std.mem.Allocator, opts: *const Options) !DDS.DataReade
     }
 
     const repr_id: i16 = if (opts.data_representation == 2) 2 else 0;
-    try qos.data_representation.value.append(alloc, repr_id);
+    const repr_buf = try alloc.alloc(DDS.DataRepresentationId_t, 1);
+    repr_buf[0] = repr_id;
+    qos.data_representation.value = .{ ._buffer = repr_buf.ptr, ._length = 1, ._maximum = 1, ._release = true };
 
     return qos;
 }
@@ -339,7 +307,7 @@ fn createExtraTopics(
     for (0..et.count) |i| {
         et.names[i] = try std.fmt.allocPrint(alloc, "{s}{d}", .{ opts.topic_name, i + 1 });
         stdoutPrint("Create topic: {s}\n", .{et.names[i]});
-        et.topics[i] = dp.vtable.create_topic(dp.ptr, et.names[i], "ShapeType", .{}, dds.nilTopicListener(), 0);
+        et.topics[i] = dp.create_topic(et.names[i], "ShapeType", .{}, null, 0);
         if (isNilTopic(et.topics[i])) {
             // Free names allocated so far then signal failure
             for (0..i + 1) |j| alloc.free(et.names[j]);
@@ -373,16 +341,21 @@ fn runPublisher(
         .coherent_access = opts.coherent_access,
         .ordered_access = opts.ordered_access,
     };
-    var pub_partition_name_buf: [1][]const u8 = .{opts.partition orelse ""};
+    // Partition names must be [*:0]const u8 in StringSeq (C PSM layout).
+    // argv strings are always null-terminated so the ptrCast is safe.
+    var pub_partition_cstrs: [1][*:0]const u8 = .{
+        if (opts.partition) |p| @as([*:0]const u8, @ptrCast(p.ptr)) else "",
+    };
+    const pub_partition_seq = DDS.StringSeq{ ._buffer = @ptrCast(&pub_partition_cstrs), ._length = 1, ._maximum = 1, ._release = false };
     const pub_qos: DDS.PublisherQos = if (opts.partition) |_| .{
         .presentation = pub_presentation,
-        .partition = .{ .name = .{ .items = &pub_partition_name_buf, .capacity = 1 } },
+        .partition = .{ .name = pub_partition_seq },
     } else .{ .presentation = pub_presentation };
-    const pub_ = dp.vtable.create_publisher(dp.ptr, pub_qos, dds.nilPublisherListener(), 0);
+    const pub_ = dp.create_publisher(pub_qos, null, 0);
     if (isNilPub(pub_)) return error.PublisherFailed;
 
     var dw_qos = try buildWriterQos(alloc, opts);
-    defer dw_qos.data_representation.value.deinit(alloc);
+    defer dw_qos.deinit(alloc);
 
     // One ListenerCtx and DataWriter per topic.
     var lctxs: [MAX_TOPICS]ListenerCtx = undefined;
@@ -393,9 +366,12 @@ fn runPublisher(
     for (0..n) |i| {
         const tn = et.nameAt(opts.topic_name, @intCast(i));
         lctxs[i] = .{ .topic_name = tn };
-        const dw_listener = DDS.DataWriterListener{ .ptr = &lctxs[i], .vtable = &dw_vtable };
+        const dw_listener = DDS.dataWriterListener(&lctxs[i], .{
+            .on_offered_deadline_missed = dwOnDeadlineMissed,
+            .on_offered_incompatible_qos = dwOnIncompatQos,
+        });
         const t = et.topicAt(base_topic, @intCast(i));
-        writers[i] = pub_.vtable.create_datawriter(pub_.ptr, t, dw_qos, dw_listener, listener_mask);
+        writers[i] = pub_.create_datawriter(t, dw_qos, dw_listener, listener_mask);
         if (isNilDw(writers[i])) return error.DataWriterFailed;
         stdoutPrint("Create writer for topic: {s} color: {s}\n", .{ tn, base_color });
     }
@@ -544,12 +520,12 @@ fn runSubscriber(
         const base_name = et.nameAt(opts.topic_name, 0);
         const cft_name = std.fmt.allocPrint(alloc, "{s}_cft", .{base_name}) catch break :blk null;
         defer alloc.free(cft_name);
-        const c = dp.vtable.create_contentfilteredtopic(dp.ptr, cft_name, base_topic, expr, .empty);
+        const c = dp.create_contentfilteredtopic(cft_name, base_topic, expr, null);
         if (isNilCft(c)) break :blk null;
         break :blk c;
     };
     defer {
-        if (cft) |c| _ = dp.vtable.delete_contentfilteredtopic(dp.ptr, c);
+        if (cft) |c| _ = dp.delete_contentfilteredtopic(c);
     }
 
     const sub_presentation = DDS.PresentationQosPolicy{
@@ -561,16 +537,19 @@ fn runSubscriber(
         .coherent_access = opts.coherent_access,
         .ordered_access = opts.ordered_access,
     };
-    var sub_partition_name_buf: [1][]const u8 = .{opts.partition orelse ""};
+    var sub_partition_cstrs: [1][*:0]const u8 = .{
+        if (opts.partition) |p| @as([*:0]const u8, @ptrCast(p.ptr)) else "",
+    };
+    const sub_partition_seq = DDS.StringSeq{ ._buffer = @ptrCast(&sub_partition_cstrs), ._length = 1, ._maximum = 1, ._release = false };
     const sub_qos: DDS.SubscriberQos = if (opts.partition) |_| .{
         .presentation = sub_presentation,
-        .partition = .{ .name = .{ .items = &sub_partition_name_buf, .capacity = 1 } },
+        .partition = .{ .name = sub_partition_seq },
     } else .{ .presentation = sub_presentation };
-    const sub = dp.vtable.create_subscriber(dp.ptr, sub_qos, dds.nilSubscriberListener(), 0);
+    const sub = dp.create_subscriber(sub_qos, null, 0);
     if (isNilSub(sub)) return error.SubscriberFailed;
 
     var dr_qos = try buildReaderQos(alloc, opts);
-    defer dr_qos.data_representation.value.deinit(alloc);
+    defer dr_qos.deinit(alloc);
 
     // One ListenerCtx and DataReader per topic.
     var lctxs: [MAX_TOPICS]ListenerCtx = undefined;
@@ -581,15 +560,18 @@ fn runSubscriber(
     for (0..n) |i| {
         const tn = et.nameAt(opts.topic_name, @intCast(i));
         lctxs[i] = .{ .topic_name = tn };
-        const dr_listener = DDS.DataReaderListener{ .ptr = &lctxs[i], .vtable = &dr_vtable };
+        const dr_listener = DDS.dataReaderListener(&lctxs[i], .{
+            .on_requested_deadline_missed = drOnDeadlineMissed,
+            .on_requested_incompatible_qos = drOnIncompatQos,
+        });
 
         const topic_desc: DDS.TopicDescription = if (i == 0 and cft != null)
             dds.cftTopicDescription(cft.?)
         else
-            dp.vtable.lookup_topicdescription(dp.ptr, tn);
+            dp.lookup_topicdescription(tn);
 
         stdoutPrint("Create reader for topic: {s}\n", .{tn});
-        readers[i] = sub.vtable.create_datareader(sub.ptr, topic_desc, dr_qos, dr_listener, listener_mask);
+        readers[i] = sub.create_datareader(topic_desc, dr_qos, dr_listener, listener_mask);
         if (isNilDr(readers[i])) return error.DataReaderFailed;
     }
 
@@ -914,15 +896,14 @@ pub fn main(init: std.process.Init.Minimal) !void {
     defer dds.destroyParticipant(participant);
     const dp = participant.toDDS();
 
-    dds.registerTypeSupport(dp, "ShapeType", .{ .compute_key_hash = dds.shapeKeyHashFromCdr });
+    dds.registerTypeSupport(dp, "ShapeType", .{ .ctx = undefined, .compute_key_hash = dds.shapeKeyHashFromCdr });
 
     // Create the base topic (index 0). Additional topics are created inside run functions.
-    const base_topic = dp.vtable.create_topic(
-        dp.ptr,
+    const base_topic = dp.create_topic(
         opts.topic_name,
         "ShapeType",
         .{},
-        dds.nilTopicListener(),
+        null,
         0,
     );
     if (isNilTopic(base_topic)) {
