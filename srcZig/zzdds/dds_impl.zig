@@ -179,7 +179,7 @@ pub fn registerTypeSupport(
     ts: TypeSupport,
 ) void {
     const impl: *DomainParticipantImpl = @ptrCast(@alignCast(dp.ptr));
-    impl.registerTypeSupport(type_name, ts);
+    _ = impl.registerTypeSupport(type_name, ts);
 }
 
 // ── ShapeType CDR ─────────────────────────────────────────────────────────────
