@@ -78,7 +78,8 @@ def run_subscriber_shape_main(
         file: tempfile.TemporaryFile,
         subscriber_finished: multiprocessing.Event,
         publishers_finished: "list[multiprocessing.Event]",
-        check_function: "function"):
+        check_function: "function",
+        any_force_killed=None):
 
     """ This function runs the subscriber shape_main application with
         the specified parameters. Then it saves the
@@ -132,7 +133,7 @@ def run_subscriber_shape_main(
     # Step 1: run the executable
     log_message(f'Running shape_main application Subscriber {subscriber_index}',
             verbosity)
-    child_sub = pexpect.spawnu(f'{name_executable} {parameters}')
+    child_sub = pexpect.spawnu(f'{name_executable} {parameters}', codec_errors='replace')
     child_sub.logfile = file
 
     # Step 2: Check if the topic is created
@@ -219,6 +220,8 @@ def run_subscriber_shape_main(
         log_message(f'Subscriber {subscriber_index} process did not exit '
                     'gracefully; it was forcefully terminated.',
                     verbosity)
+        if any_force_killed is not None:
+            any_force_killed.value = True
 
     return
 
@@ -235,7 +238,8 @@ def run_publisher_shape_main(
         timeout: int,
         file: tempfile.TemporaryFile,
         subscribers_finished: "list[multiprocessing.Event]",
-        publisher_finished: multiprocessing.Event):
+        publisher_finished: multiprocessing.Event,
+        any_force_killed=None):
 
     """ This function runs the publisher shape_main application with
         the specified parameters. Then it saves the
@@ -284,7 +288,7 @@ def run_publisher_shape_main(
     # Step 1: run the executable
     log_message(f'Running shape_main application Publisher {publisher_index}',
             verbosity)
-    child_pub = pexpect.spawnu(f'{name_executable} {parameters}')
+    child_pub = pexpect.spawnu(f'{name_executable} {parameters}', codec_errors='replace')
     child_pub.logfile = file
 
     # Step 2: Check if the topic is created
@@ -420,6 +424,8 @@ def run_publisher_shape_main(
         log_message(f'Publisher {publisher_index} process did not exit '
                     'gracefully; it was forcefully terminated.',
                     verbosity)
+        if any_force_killed is not None:
+            any_force_killed.value = True
 
     return
 
@@ -490,6 +496,7 @@ def run_test(
     #     - return_codes[1] contains Subscriber shape_main application ReturnCode
     manager = multiprocessing.Manager()
     return_codes = manager.list(range(num_entities))
+    any_force_killed = manager.Value('b', False)
     samples_sent = [] # used for storing the samples the Publishers send.
                       # It is a list with one Queue for each Publisher.
     last_sample_saved = [] # used for storing the last value sent by each Publisher.
@@ -542,7 +549,8 @@ def run_test(
                         'timeout':timeout,
                         'file':temporary_file[i],
                         'subscribers_finished':subscribers_finished,
-                        'publisher_finished':publishers_finished[publisher_number]}))
+                        'publisher_finished':publishers_finished[publisher_number],
+                        'any_force_killed':any_force_killed}))
             publisher_number += 1
             entity_type.append(f'Publisher_{publisher_number}')
             time.sleep(1)
@@ -567,7 +575,8 @@ def run_test(
                         'file':temporary_file[i],
                         'subscriber_finished':subscribers_finished[subscriber_number],
                         'publishers_finished':publishers_finished,
-                        'check_function':check_function}))
+                        'check_function':check_function,
+                        'any_force_killed':any_force_killed}))
             subscriber_number += 1
             entity_type.append(f'Subscriber_{subscriber_number}')
         else:
@@ -643,6 +652,8 @@ def run_test(
                     f'<br> {shape_main_application_output_edited[i]} <br>'
         message = remove_ansi_colors(message)
         test_case.result = [junitparser.Failure(message)]
+
+    return any_force_killed.value
 
     for element in temporary_file:
         element.close()
@@ -878,7 +889,8 @@ def main():
                     case = junitparser.TestCase(f'{test_suite_name}_{test_case_name}')
                     now_test_case = datetime.now()
                     log_message(f'Running test: {test_case_name}', options['verbosity'])
-                    run_test(name_executable_pub=options['publisher'],
+                    force_killed = run_test(
+                            name_executable_pub=options['publisher'],
                             name_executable_sub=options['subscriber'],
                             test_case=case,
                             parameters=parameters,
@@ -886,6 +898,8 @@ def main():
                             verbosity=options['verbosity'],
                             timeout=timeout,
                             check_function=check_function)
+                    if force_killed:
+                        time.sleep(0.5)
                     case.time = (datetime.now() - now_test_case).total_seconds()
                     suite.add_testcase(case)
 
