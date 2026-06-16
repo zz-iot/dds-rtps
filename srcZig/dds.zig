@@ -66,6 +66,7 @@
 //!     Called by the generated ShapeTypeDataReader.take() and directly by
 //!     shape_main for NOT_ALIVE sample key extraction.
 //!
+//!   pub fn writerWaitForAck(dw: DDS.DataWriter, timeout: DDS.Duration_t) DDS.ReturnCode_t;
 //!   pub fn writerMatchedCount(dw: DDS.DataWriter) usize;
 //!   pub fn writerNotifyDeadline(dw: DDS.DataWriter) void;
 //!   pub fn readerMatchedCount(dr: DDS.DataReader) usize;
