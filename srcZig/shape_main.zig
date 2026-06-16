@@ -505,8 +505,13 @@ fn runPublisher(
                 }
             }
         }
-        // Brief drain to let RELIABLE transport deliver the NOT_ALIVE changes.
-        sleepNs(300 * std.time.ns_per_ms);
+        // Wait until all reliable readers have ACKed the NOT_ALIVE changes,
+        // or up to 5 s, to avoid exiting before RELIABLE transport has
+        // delivered the unregister/dispose changes to matched readers.
+        const ack_timeout = DDS.Duration_t{ .sec = 5, .nanosec = 0 };
+        for (0..n) |ti| {
+            _ = dds.writerWaitForAck(typed_writers[ti]._dw, ack_timeout);
+        }
     }
 }
 

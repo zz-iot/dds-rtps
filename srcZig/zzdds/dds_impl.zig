@@ -123,6 +123,10 @@ pub fn writeCdr(
     _ = try impl.writeRaw(ck, time_mod.RtpsTimestamp.now(), history_mod.INSTANCE_HANDLE_NIL, key_hash, data);
 }
 
+pub fn writerWaitForAck(dw: DDS.DataWriter, timeout: DDS.Duration_t) DDS.ReturnCode_t {
+    return dw.vtable.wait_for_acknowledgments(dw.ptr, &timeout);
+}
+
 pub fn writerMatchedCount(dw: DDS.DataWriter) usize {
     const impl: *DataWriterImpl = @ptrCast(@alignCast(dw.ptr));
     return impl.matchedReaderCount();
