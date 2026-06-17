@@ -440,6 +440,15 @@ fn runPublisher(
             }
         }
 
+        // For coherent publishers, hold off writing until a reader has matched.
+        // Connext's GROUP coherent subscriber requires the group sequence to
+        // start from 1; writing before match would advance the GSN so the
+        // subscriber joins mid-stream and never receives a complete set.
+        if (use_coherent_gating and !printed_matched) {
+            sleepNs(opts.write_period_ms * std.time.ns_per_ms);
+            continue;
+        }
+
         if (deadline_ns > 0) {
             const elapsed = monoNs() - last_write_ns;
             if (elapsed > deadline_ns) dds.writerNotifyDeadline(dw_handles[0]);
