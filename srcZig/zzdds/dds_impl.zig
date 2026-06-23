@@ -123,6 +123,10 @@ pub fn writeCdr(
     _ = try impl.writeRaw(ck, time_mod.RtpsTimestamp.now(), history_mod.INSTANCE_HANDLE_NIL, key_hash, data);
 }
 
+// Aliases expected by the zidl-generated ShapeTypeDataWriter/ShapeTypeDataReader.
+pub const writeRaw = writeCdr;
+pub const takeRaw = takeCdr;
+
 pub fn writerWaitForAck(dw: DDS.DataWriter, timeout: DDS.Duration_t) DDS.ReturnCode_t {
     return dw.vtable.wait_for_acknowledgments(dw.ptr, &timeout);
 }

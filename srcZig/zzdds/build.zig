@@ -40,7 +40,7 @@ pub fn build(b: *std.Build) void {
     // The generated shape.zig uses ShapeTypeDataWriter/ShapeTypeDataReader which
     // call into dds_mod via @import("dds").  Output lands in the build cache.
     const gen_shape = b.addRunArtifact(zidl_exe);
-    gen_shape.addArgs(&.{ "-b", "zig", "--split-files", "-o" });
+    gen_shape.addArgs(&.{ "-b", "zig", "--split-files", "--generate-zzdds-wrappers", "-o" });
     const shape_gen_dir = gen_shape.addOutputDirectoryArg("shape-generated");
     gen_shape.addFileArg(b.path("../shape.idl"));
 
