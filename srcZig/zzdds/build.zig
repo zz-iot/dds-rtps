@@ -24,8 +24,8 @@ pub fn build(b: *std.Build) void {
     const zidl_rt_mod = zidl_dep.module("zidl_rt");
 
     // Build the "dds" shim module from our vendor implementation.
-    // dds_impl.zig provides raw DDS plumbing (writeCdr, takeCdr, participant
-    // bootstrapping) with no knowledge of ShapeType or CDR encoding.
+    // dds_impl.zig provides participant bootstrapping and entity-management
+    // helpers.  CDR encoding is handled by the generated typed wrappers.
     const dds_mod = b.createModule(.{
         .root_source_file = b.path("dds_impl.zig"),
         .target = target,
@@ -50,7 +50,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{
             .{ .name = "zidl_rt", .module = zidl_rt_mod },
-            .{ .name = "dds", .module = dds_mod },
+            .{ .name = "zzdds", .module = zzdds_mod },
         },
     });
 

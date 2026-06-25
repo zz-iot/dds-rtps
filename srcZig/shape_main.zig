@@ -8,10 +8,8 @@
 //! build.zig.  See srcZig/dds.zig for the full interface contract.
 //!
 //! CDR serialization and key-hash computation are handled by the zidl-generated
-//! "shape_gen" module (ShapeTypeDataWriter / ShapeTypeDataReader).  The only
-//! encoding decision made here is which data_representation to request on the
-//! QoS (XCDR1 vs XCDR2); the typed wrappers select the correct CDR encoding
-//! based on the xcdr2 flag passed to ShapeTypeDataWriter.init().
+//! "shape_gen" module (ShapeTypeDataWriter / ShapeTypeDataReader).  The typed
+//! wrappers query the DataWriter QoS at init time to select XCDR1 vs XCDR2.
 //!
 //! Required stdout strings (matched by the harness via pexpect):
 //!   Publisher: "Create topic:"  →  "Create writer for topic:"  →
@@ -333,7 +331,6 @@ fn runPublisher(
 ) !void {
     const base_color = opts.color orelse "BLUE";
     const n = opts.num_topics;
-    const xcdr2 = opts.data_representation == 2;
 
     var et = try createExtraTopics(alloc, dp, opts);
     defer et.deinitNames(alloc);
@@ -380,7 +377,7 @@ fn runPublisher(
         const t = et.topicAt(base_topic, @intCast(i));
         dw_handles[i] = pub_.create_datawriter(t, dw_qos, dw_listener, listener_mask);
         if (isNilDw(dw_handles[i])) return error.DataWriterFailed;
-        typed_writers[i] = shape_gen.ShapeTypeDataWriter.init(dw_handles[i], alloc, xcdr2);
+        typed_writers[i] = shape_gen.ShapeTypeDataWriter.init(dw_handles[i], alloc);
         stdoutPrint("Create writer for topic: {s} color: {s}\n", .{ tn, base_color });
     }
 
@@ -466,7 +463,7 @@ fn runPublisher(
                     const inst_color = try instanceColor(alloc, base_color, inst);
                     defer if (inst > 0) alloc.free(inst_color);
                     shape.color = ShapeColor.fromSlice(inst_color) catch .{};
-                    try typed_writers[ti].write(shape);
+                    try typed_writers[ti].write(shape, 0);
                     if (opts.print_writer_samples) {
                         stdoutPrint("{s:<10} {s:<10} {d:0>3} {d:0>3} [{d}]\n", .{ lctxs[ti].topic_name, inst_color, @as(u32, @intCast(shape.x)), @as(u32, @intCast(shape.y)), shape.shapesize });
                     }
@@ -480,7 +477,7 @@ fn runPublisher(
                     const inst_color = try instanceColor(alloc, base_color, inst);
                     defer if (inst > 0) alloc.free(inst_color);
                     shape.color = ShapeColor.fromSlice(inst_color) catch .{};
-                    try typed_writers[ti].write(shape);
+                    try typed_writers[ti].write(shape, 0);
                     if (opts.print_writer_samples) {
                         stdoutPrint("{s:<10} {s:<10} {d:0>3} {d:0>3} [{d}]\n", .{ lctxs[ti].topic_name, inst_color, @as(u32, @intCast(shape.x)), @as(u32, @intCast(shape.y)), shape.shapesize });
                     }
@@ -508,9 +505,9 @@ fn runPublisher(
                 defer if (inst > 0) alloc.free(inst_color);
                 const key = shape_gen.ShapeType{ .color = ShapeColor.fromSlice(inst_color) catch .{} };
                 if (do_dispose) {
-                    typed_writers[ti].dispose(key) catch {};
+                    typed_writers[ti].dispose(key, 0) catch {};
                 } else {
-                    typed_writers[ti].unregister(key) catch {};
+                    typed_writers[ti].unregister_instance(key, 0) catch {};
                 }
             }
         }
@@ -519,7 +516,7 @@ fn runPublisher(
         // delivered the unregister/dispose changes to matched readers.
         const ack_timeout = DDS.Duration_t{ .sec = 5, .nanosec = 0 };
         for (0..n) |ti| {
-            _ = dds.writerWaitForAck(typed_writers[ti]._dw, ack_timeout);
+            _ = dds.writerWaitForAck(typed_writers[ti].dataWriter(), ack_timeout);
         }
     }
 }
@@ -582,9 +579,10 @@ fn runSubscriber(
     var dr_qos = try buildReaderQos(alloc, opts);
     defer dr_qos.deinit(alloc);
 
-    // One ListenerCtx and raw DataReader handle per topic.
+    // One ListenerCtx, raw DataReader handle, and typed DataReader per topic.
     var lctxs: [MAX_TOPICS]ListenerCtx = undefined;
     var dr_handles: [MAX_TOPICS]DDS.DataReader = undefined;
+    var typed_readers: [MAX_TOPICS]shape_gen.ShapeTypeDataReader = undefined;
     const listener_mask: DDS.StatusMask =
         DDS.REQUESTED_INCOMPATIBLE_QOS_STATUS | DDS.REQUESTED_DEADLINE_MISSED_STATUS;
 
@@ -604,6 +602,7 @@ fn runSubscriber(
         stdoutPrint("Create reader for topic: {s}\n", .{tn});
         dr_handles[i] = sub.create_datareader(topic_desc, dr_qos, dr_listener, listener_mask);
         if (isNilDr(dr_handles[i])) return error.DataReaderFailed;
+        typed_readers[i] = shape_gen.ShapeTypeDataReader.init(dr_handles[i], alloc);
     }
 
     const sub_deadline_ns: i64 = if (opts.deadline_ms > 0)
@@ -656,25 +655,41 @@ fn runSubscriber(
         var got_data = false;
         for (0..n) |ti| {
             const tn = lctxs[ti].topic_name;
-            while (dds.takeCdr(dr_handles[ti])) |taken| {
-                defer taken.deinit();
+            while (true) {
+                var value: shape_gen.ShapeType = .{};
+                var info: DDS.SampleInfo = .{};
+                const got = typed_readers[ti].take_next_sample(&value, &info) catch {
+                    // CDR error (e.g. Connext key-only payload with no data body).
+                    // sample_info was populated before the failure; handle NOT_ALIVE
+                    // state using the deserialized key or the instance handle cache.
+                    if (info.instance_state == DDS.NOT_ALIVE_NO_WRITERS_INSTANCE_STATE or
+                        info.instance_state == DDS.NOT_ALIVE_DISPOSED_INSTANCE_STATE)
+                    {
+                        var key_color: ShapeColor = value.color;
+                        if (key_color.slice().len == 0) {
+                            if (ih_to_color.get(info.instance_handle)) |cached| key_color = cached;
+                        }
+                        const state_str = if (info.instance_state == DDS.NOT_ALIVE_DISPOSED_INSTANCE_STATE)
+                            "NOT_ALIVE_DISPOSED_INSTANCE_STATE"
+                        else
+                            "NOT_ALIVE_NO_WRITERS_INSTANCE_STATE";
+                        stdoutPrint("{s:<10} {s:<10} {s}\n", .{ tn, key_color.slice(), state_str });
+                    }
+                    value.deinit(alloc);
+                    continue;
+                };
+                if (!got) break;
+                defer value.deinit(alloc);
                 got_data = true;
 
-                if (taken.instance_state == DDS.NOT_ALIVE_NO_WRITERS_INSTANCE_STATE or
-                    taken.instance_state == DDS.NOT_ALIVE_DISPOSED_INSTANCE_STATE)
+                if (info.instance_state == DDS.NOT_ALIVE_NO_WRITERS_INSTANCE_STATE or
+                    info.instance_state == DDS.NOT_ALIVE_DISPOSED_INSTANCE_STATE)
                 {
-                    // NOT_ALIVE samples may have a key-only payload or no payload at all.
-                    // Extract the color via deserializeKey; fall back to the cached color
-                    // from the instance handle map if the payload is empty or unreadable.
-                    var key_color: ShapeColor = blk: {
-                        var reader = zidl_rt.CdrReader.init(taken.data) catch break :blk .{};
-                        const key_shape = shape_gen.ShapeType.deserializeKey(&reader, alloc) catch break :blk .{};
-                        break :blk key_shape.color;
-                    };
+                    var key_color: ShapeColor = value.color;
                     if (key_color.slice().len == 0) {
-                        if (ih_to_color.get(taken.instance_handle)) |cached| key_color = cached;
+                        if (ih_to_color.get(info.instance_handle)) |cached| key_color = cached;
                     }
-                    const state_str = if (taken.instance_state == DDS.NOT_ALIVE_DISPOSED_INSTANCE_STATE)
+                    const state_str = if (info.instance_state == DDS.NOT_ALIVE_DISPOSED_INSTANCE_STATE)
                         "NOT_ALIVE_DISPOSED_INSTANCE_STATE"
                     else
                         "NOT_ALIVE_NO_WRITERS_INSTANCE_STATE";
@@ -682,16 +697,12 @@ fn runSubscriber(
                     continue;
                 }
 
-                var reader = zidl_rt.CdrReader.init(taken.data) catch continue;
-                var s = shape_gen.ShapeType.deserialize(&reader, alloc) catch continue;
-                defer s.deinit(alloc);
-
-                ih_to_color.put(taken.instance_handle, s.color) catch {};
+                ih_to_color.put(info.instance_handle, value.color) catch {};
 
                 // CFT post-filter (only for topic[0] when CFT is active).
                 if (ti == 0) {
                     if (cft) |c| {
-                        var acc_ctx = ShapeAccessor{ .shape = &s };
+                        var acc_ctx = ShapeAccessor{ .shape = &value };
                         const accessor = dds.FieldAccessor{
                             .ctx = &acc_ctx,
                             .get = ShapeAccessor.get,
@@ -700,16 +711,16 @@ fn runSubscriber(
                     }
                 }
 
-                const extra_len = s.additional_payload_size._length;
-                const last_byte: ?u8 = if (extra_len > 0 and s.additional_payload_size._buffer != null)
-                    s.additional_payload_size._buffer.?[extra_len - 1]
+                const extra_len = value.additional_payload_size._length;
+                const last_byte: ?u8 = if (extra_len > 0 and value.additional_payload_size._buffer != null)
+                    value.additional_payload_size._buffer.?[extra_len - 1]
                 else
                     null;
 
                 if (last_byte) |lb| {
-                    stdoutPrint("{s:<10} {s:<10} {d:0>3} {d:0>3} [{d}] {{{d}}}\n", .{ tn, s.color.slice(), @as(u32, @intCast(s.x)), @as(u32, @intCast(s.y)), s.shapesize, lb });
+                    stdoutPrint("{s:<10} {s:<10} {d:0>3} {d:0>3} [{d}] {{{d}}}\n", .{ tn, value.color.slice(), @as(u32, @intCast(value.x)), @as(u32, @intCast(value.y)), value.shapesize, lb });
                 } else {
-                    stdoutPrint("{s:<10} {s:<10} {d:0>3} {d:0>3} [{d}]\n", .{ tn, s.color.slice(), @as(u32, @intCast(s.x)), @as(u32, @intCast(s.y)), s.shapesize });
+                    stdoutPrint("{s:<10} {s:<10} {d:0>3} {d:0>3} [{d}]\n", .{ tn, value.color.slice(), @as(u32, @intCast(value.x)), @as(u32, @intCast(value.y)), value.shapesize });
                 }
             }
         }
@@ -767,7 +778,7 @@ fn parseArgs(process_args: std.process.Args) !Options {
         } else if (std.mem.eql(u8, arg, "-w")) {
             opts.print_writer_samples = true;
         } else if (std.mem.eql(u8, arg, "-R")) {
-            // use read() instead of take() — no-op (we always use takeCdr)
+            // use read() instead of take() — no-op (we always use take_next_sample)
         } else if (std.mem.eql(u8, arg, "-d")) {
             const v = it.next() orelse return error.MissingValue;
             opts.domain_id = try std.fmt.parseInt(u32, v, 10);

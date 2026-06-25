@@ -1,13 +1,9 @@
-//! ZenzenDDS implementation of the srcZig/dds shim protocol.
+//! ZenzenDDS implementation used by shape_main.zig.
 //!
-//! shape_main.zig imports this module as "dds".  Every symbol exported here
-//! matches the protocol documented in srcZig/dds.zig; see that file for the
-//! full contract that any Zig DDS vendor must satisfy.
-//!
-//! CDR serialization and key-hash computation are NOT handled here.  They live
-//! in the zidl-generated shape.zig (imported by shape_main.zig as "shape_gen").
-//! This module only exposes raw RTPS plumbing: writeCdr / takeCdr and the DDS
-//! entity-management functions used by shape_main.zig.
+//! shape_main.zig imports this module as "dds".  Provides participant
+//! bootstrapping and the DDS entity-management helpers used by shape_main.zig.
+//! CDR serialization lives in the zidl-generated shape.zig (shape_gen module);
+//! the generated ShapeTypeDataWriter/DataReader import zzdds directly.
 
 const std = @import("std");
 
@@ -15,12 +11,6 @@ const zzdds = @import("zzdds");
 const zzdds_gen = @import("zzdds_generated");
 
 pub const DDS = zzdds_gen.DDS;
-
-// Type aliases required by the generated ShapeTypeDataWriter / ShapeTypeDataReader.
-pub const DataWriter = DDS.DataWriter;
-pub const DataReader = DDS.DataReader;
-pub const InstanceStateKind = DDS.InstanceStateKind;
-pub const InstanceHandle_t = DDS.InstanceHandle_t;
 
 const UdpTransport = zzdds.udp_transport.UdpTransport;
 const SpdpSedpDiscovery = zzdds.combined_discovery.SpdpSedpDiscovery;
@@ -31,8 +21,6 @@ const DataReaderImpl = zzdds.dcps.DataReaderImpl;
 const TopicImpl = zzdds.dcps.TopicImpl;
 const ContentFilteredTopicImpl = zzdds.dcps.ContentFilteredTopicImpl;
 const noop_security = zzdds.noop_security.noop_security_plugins;
-const time_mod = zzdds.util.time;
-const history_mod = zzdds.rtps.history;
 const nil = zzdds.dcps;
 const filter_mod = zzdds.dcps.filter;
 
@@ -104,29 +92,6 @@ pub fn topicName(topic: DDS.Topic) []const u8 {
 
 // ── DataWriter extras ─────────────────────────────────────────────────────────
 
-pub const WriteKind = enum { alive, dispose, unregister };
-
-/// Write a pre-serialized CDR payload.  Called by the generated ShapeTypeDataWriter
-/// and also directly by shape_main for raw dispose/unregister payloads.
-pub fn writeCdr(
-    dw: DDS.DataWriter,
-    kind: WriteKind,
-    key_hash: [16]u8,
-    data: []const u8,
-) !void {
-    const impl: *DataWriterImpl = @ptrCast(@alignCast(dw.ptr));
-    const ck: history_mod.ChangeKind = switch (kind) {
-        .alive => .alive,
-        .dispose => .not_alive_disposed,
-        .unregister => .not_alive_unregistered,
-    };
-    _ = try impl.writeRaw(ck, time_mod.RtpsTimestamp.now(), history_mod.INSTANCE_HANDLE_NIL, key_hash, data);
-}
-
-// Aliases expected by the zidl-generated ShapeTypeDataWriter/ShapeTypeDataReader.
-pub const writeRaw = writeCdr;
-pub const takeRaw = takeCdr;
-
 pub fn writerWaitForAck(dw: DDS.DataWriter, timeout: DDS.Duration_t) DDS.ReturnCode_t {
     return dw.vtable.wait_for_acknowledgments(dw.ptr, &timeout);
 }
@@ -142,32 +107,6 @@ pub fn writerNotifyDeadline(dw: DDS.DataWriter) void {
 }
 
 // ── DataReader extras ─────────────────────────────────────────────────────────
-
-/// Raw sample returned by takeCdr.  Caller must call deinit() when done.
-pub const RawSample = struct {
-    data: []u8,
-    alloc: std.mem.Allocator,
-    instance_state: DDS.InstanceStateKind,
-    instance_handle: DDS.InstanceHandle_t,
-
-    pub fn deinit(self: RawSample) void {
-        self.alloc.free(self.data);
-    }
-};
-
-/// Pop the next pending sample from dr, or return null if the queue is empty.
-/// Called by the generated ShapeTypeDataReader and directly by shape_main for
-/// NOT_ALIVE sample handling (which needs the raw payload to extract the key).
-pub fn takeCdr(dr: DDS.DataReader) ?RawSample {
-    const impl: *DataReaderImpl = @ptrCast(@alignCast(dr.ptr));
-    const taken = impl.takeRaw() orelse return null;
-    return .{
-        .data = taken.data,
-        .alloc = impl.alloc,
-        .instance_state = taken.info.instance_state,
-        .instance_handle = taken.info.instance_handle,
-    };
-}
 
 pub fn readerMatchedCount(dr: DDS.DataReader) usize {
     const impl: *DataReaderImpl = @ptrCast(@alignCast(dr.ptr));
