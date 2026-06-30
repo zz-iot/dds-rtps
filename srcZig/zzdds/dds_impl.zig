@@ -12,15 +12,11 @@ const zzdds_gen = @import("zzdds_generated");
 
 pub const DDS = zzdds_gen.DDS;
 
-const UdpTransport = zzdds.udp_transport.UdpTransport;
-const SpdpSedpDiscovery = zzdds.combined_discovery.SpdpSedpDiscovery;
-const DomainParticipantFactoryImpl = zzdds.dcps.DomainParticipantFactoryImpl;
 const DomainParticipantImpl = zzdds.dcps.DomainParticipantImpl;
 const DataWriterImpl = zzdds.dcps.DataWriterImpl;
 const DataReaderImpl = zzdds.dcps.DataReaderImpl;
 const TopicImpl = zzdds.dcps.TopicImpl;
 const ContentFilteredTopicImpl = zzdds.dcps.ContentFilteredTopicImpl;
-const noop_security = zzdds.noop_security.noop_security_plugins;
 const nil = zzdds.dcps;
 const filter_mod = zzdds.dcps.filter;
 
@@ -28,9 +24,7 @@ const filter_mod = zzdds.dcps.filter;
 
 pub const Participant = struct {
     alloc: std.mem.Allocator,
-    udp: *UdpTransport,
-    disc: *SpdpSedpDiscovery,
-    factory: *DomainParticipantFactoryImpl,
+    factory: zzdds.DomainParticipantFactory,
     dp: DDS.DomainParticipant,
 
     pub fn toDDS(self: *Participant) DDS.DomainParticipant {
@@ -42,22 +36,7 @@ pub fn createParticipant(alloc: std.mem.Allocator, domain_id: u32) !*Participant
     const p = try alloc.create(Participant);
     errdefer alloc.destroy(p);
 
-    const udp = try UdpTransport.init(alloc, .{}, domain_id, null);
-    errdefer udp.deinit();
-    const transport = udp.transport();
-
-    const disc = try SpdpSedpDiscovery.init(alloc, transport, domain_id, 3_000);
-    errdefer disc.deinit();
-    const discovery = disc.toDiscovery();
-
-    var factory = try DomainParticipantFactoryImpl.init(
-        alloc,
-        transport,
-        discovery,
-        noop_security,
-        .spec_random,
-        .{},
-    );
+    var factory = try zzdds.createFactory();
     errdefer factory.deinit();
     const dpf = factory.toDDSFactory();
 
@@ -66,8 +45,6 @@ pub fn createParticipant(alloc: std.mem.Allocator, domain_id: u32) !*Participant
 
     p.* = .{
         .alloc = alloc,
-        .udp = udp,
-        .disc = disc,
         .factory = factory,
         .dp = dp,
     };
@@ -78,8 +55,6 @@ pub fn destroyParticipant(p: *Participant) void {
     const dpf = p.factory.toDDSFactory();
     _ = dpf.delete_participant(p.dp);
     p.factory.deinit();
-    p.disc.deinit();
-    p.udp.deinit();
     p.alloc.destroy(p);
 }
 
