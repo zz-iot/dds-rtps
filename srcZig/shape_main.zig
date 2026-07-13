@@ -414,10 +414,11 @@ fn runPublisher(
         0;
     var last_write_ns: i64 = monoNs();
 
-    // Coherent set gating: begin/end coherent_changes every coherent_sample_count iterations.
-    // When coherent_access is enabled but no explicit count given (sc=0), default to 1 so
-    // that every outer write-loop iteration is its own coherent set.  This ensures
-    // PID_COHERENT_SET is emitted even for single-sample sets (required by Connext).
+    // Coherent set gating: each outer write-loop iteration is one whole coherent
+    // window (begin_coherent_changes -> `sc` consecutive samples per instance ->
+    // end_coherent_changes). When coherent_access is enabled but no explicit count
+    // is given (sc=0), default to 1 so that PID_COHERENT_SET is still emitted for
+    // single-sample sets (required by Connext).
     const sc: u32 = if (opts.coherent_sample_count > 0) opts.coherent_sample_count else 1;
     const use_coherent_gating = opts.coherent_access or opts.ordered_access;
 
@@ -451,27 +452,40 @@ fn runPublisher(
             if (elapsed > deadline_ns) dds.writerNotifyDeadline(dw_handles[0]);
         }
 
-        shape.x = @rem(@as(i32, rand.int(u16)), 320);
-        shape.y = @rem(@as(i32, rand.int(u16)), 240);
-
         if (use_coherent_gating) {
-            const iter_mod = @as(u32, @intCast(@mod(iteration, @as(i64, sc))));
-            if (iter_mod == 0) _ = pub_.vtable.begin_coherent_changes(pub_.ptr);
+            // Write a whole coherent window (all topics x instances x `sc` samples)
+            // in one begin/end pass, `sc` samples per instance consecutively, so the
+            // wire order groups by instance instead of interleaving (round-robin
+            // order can never satisfy the interop suite's consecutive-same-instance
+            // check, independent of anything the reader side does).
+            _ = pub_.vtable.begin_coherent_changes(pub_.ptr);
 
             for (0..n) |ti| {
                 for (0..opts.num_instances) |inst| {
                     const inst_color = try instanceColor(alloc, base_color, inst);
                     defer if (inst > 0) alloc.free(inst_color);
                     shape.color = ShapeColor.fromSlice(inst_color) catch .{};
-                    try typed_writers[ti].write(shape, 0);
-                    if (opts.print_writer_samples) {
-                        stdoutPrint("{s:<10} {s:<10} {d:0>3} {d:0>3} [{d}]\n", .{ lctxs[ti].topic_name, inst_color, @as(u32, @intCast(shape.x)), @as(u32, @intCast(shape.y)), shape.shapesize });
+                    for (0..sc) |_| {
+                        shape.x = @rem(@as(i32, rand.int(u16)), 320);
+                        shape.y = @rem(@as(i32, rand.int(u16)), 240);
+                        try typed_writers[ti].write(shape, 0);
+                        if (opts.print_writer_samples) {
+                            stdoutPrint("{s:<10} {s:<10} {d:0>3} {d:0>3} [{d}]\n", .{ lctxs[ti].topic_name, inst_color, @as(u32, @intCast(shape.x)), @as(u32, @intCast(shape.y)), shape.shapesize });
+                        }
+                        if (opts.shapesize == 0) {
+                            shape.shapesize += 1;
+                            if (opts.size_modulo > 0 and shape.shapesize > opts.size_modulo)
+                                shape.shapesize = 1;
+                        }
                     }
                 }
             }
 
-            if (iter_mod == sc - 1) _ = pub_.vtable.end_coherent_changes(pub_.ptr);
+            _ = pub_.vtable.end_coherent_changes(pub_.ptr);
         } else {
+            shape.x = @rem(@as(i32, rand.int(u16)), 320);
+            shape.y = @rem(@as(i32, rand.int(u16)), 240);
+
             for (0..n) |ti| {
                 for (0..opts.num_instances) |inst| {
                     const inst_color = try instanceColor(alloc, base_color, inst);
@@ -483,12 +497,12 @@ fn runPublisher(
                     }
                 }
             }
-        }
 
-        if (opts.shapesize == 0) {
-            shape.shapesize += 1;
-            if (opts.size_modulo > 0 and shape.shapesize > opts.size_modulo)
-                shape.shapesize = 1;
+            if (opts.shapesize == 0) {
+                shape.shapesize += 1;
+                if (opts.size_modulo > 0 and shape.shapesize > opts.size_modulo)
+                    shape.shapesize = 1;
+            }
         }
 
         last_write_ns = monoNs();
@@ -658,7 +672,16 @@ fn runSubscriber(
             while (true) {
                 var value: shape_gen.ShapeType = .{};
                 var info: DDS.SampleInfo = .{};
-                const got = typed_readers[ti].take_next_sample(&value, &info) catch {
+                // --take-read: take() [take_next_sample, FIFO delivery order] vs the
+                // default take_next_instance() [samples grouped consecutively by
+                // instance]. Passing HANDLE_NIL (0) every call — rather than advancing
+                // to the last-seen instance handle — makes take_next_instance() drain
+                // each instance fully before moving to the next, since it always
+                // retargets the smallest pending instance handle above the threshold.
+                const got = (if (opts.take_read)
+                    typed_readers[ti].take_next_sample(&value, &info)
+                else
+                    typed_readers[ti].take_next_instance(&value, &info, 0)) catch {
                     // CDR error (e.g. Connext key-only payload with no data body).
                     // sample_info was populated before the failure; handle NOT_ALIVE
                     // state using the deserialized key or the instance handle cache.
@@ -778,7 +801,8 @@ fn parseArgs(process_args: std.process.Args) !Options {
         } else if (std.mem.eql(u8, arg, "-w")) {
             opts.print_writer_samples = true;
         } else if (std.mem.eql(u8, arg, "-R")) {
-            // use read() instead of take() — no-op (we always use take_next_sample)
+            // use read() instead of take() — no-op; not exercised by any interop
+            // test today (distinct from --take-read, which is wired below).
         } else if (std.mem.eql(u8, arg, "-d")) {
             const v = it.next() orelse return error.MissingValue;
             opts.domain_id = try std.fmt.parseInt(u32, v, 10);
