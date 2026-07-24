@@ -9,8 +9,10 @@ const std = @import("std");
 
 const zzdds = @import("zzdds");
 const zzdds_gen = @import("zzdds_generated");
+const zzdds_ext_gen = @import("zzdds_ext_generated");
 
 pub const DDS = zzdds_gen.DDS;
+const ZZDDS = zzdds_ext_gen.zzdds;
 
 const DomainParticipantImpl = zzdds.dcps.DomainParticipantImpl;
 const DataWriterImpl = zzdds.dcps.DataWriterImpl;
@@ -32,15 +34,31 @@ pub const Participant = struct {
     }
 };
 
+/// ZZDDS_INTEROP_TCP_BIND, when set, switches this participant's user-data
+/// (DataWriter/DataReader) traffic to a dedicated TCP transport, bound/advertised
+/// at the given address (e.g. "127.0.0.1"). SPDP/SEDP discovery is unaffected —
+/// it always uses UDP, and the resulting TCP locator simply rides along in the
+/// normal SPDP announcement. Used to exercise the TCP transport end-to-end via
+/// self-interop without needing a separate harness-level config surface.
 pub fn createParticipant(alloc: std.mem.Allocator, domain_id: u32) !*Participant {
     const p = try alloc.create(Participant);
     errdefer alloc.destroy(p);
 
     var factory = try zzdds.createFactory();
     errdefer factory.deinit();
-    const dpf = factory.toDDSFactory();
 
-    const dp = dpf.create_participant(domain_id, .{}, null, 0);
+    const tcp_bind: ?[]const u8 = if (std.c.getenv("ZZDDS_INTEROP_TCP_BIND")) |v| std.mem.span(v) else null;
+
+    const dp = if (tcp_bind) |bind_addr| blk: {
+        const zdf = factory.toZZDDSFactory();
+        var cfg = ZZDDS.DomainParticipantConfig.default();
+        cfg.transport.tcp.enabled = true;
+        cfg.transport.tcp.bind_address = bind_addr;
+        break :blk zdf.create_participant_ex(domain_id, .{}, null, 0, cfg);
+    } else blk: {
+        const dpf = factory.toDDSFactory();
+        break :blk dpf.create_participant(domain_id, .{}, null, 0);
+    };
     if (dp.ptr == nil.NIL_PTR) return error.ParticipantFailed;
 
     p.* = .{
