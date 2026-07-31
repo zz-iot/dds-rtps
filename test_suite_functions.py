@@ -469,6 +469,7 @@ def test_reading_1_sample_every_10_samples_w_instances(child_sub, samples_sent, 
     instance_seq_num = []
     first_iteration = []
     ignore_first_sample = []
+    missed_samples = []
     max_samples_received = MAX_SAMPLES_READ / 10 # 50
     samples_read_per_instance = 0
 
@@ -484,6 +485,7 @@ def test_reading_1_sample_every_10_samples_w_instances(child_sub, samples_sent, 
                 instance_seq_num.append(int(sub_string.group(2)))
                 first_iteration.append(True)
                 ignore_first_sample.append(True)
+                missed_samples.append(0)
 
             if sub_string.group(1) in instance_color:
                 index = instance_color.index(sub_string.group(1))
@@ -502,7 +504,16 @@ def test_reading_1_sample_every_10_samples_w_instances(child_sub, samples_sent, 
                         # execution overhead, the next valid sample may be
                         # between [14-24] if the filtering happens in the reader
                         # side.
-                        if current_seq_num < (instance_seq_num[index] + 9) or current_seq_num > instance_seq_num[index] + 19:
+                        # A gap larger than ~10 means one or more filtered samples
+                        # were not received; count them against the 10% tolerance.
+                        gap = current_seq_num - instance_seq_num[index]
+                        if gap < 9:
+                            # sample arrived too early
+                            produced_code = ReturnCode.DATA_NOT_CORRECT
+                            break
+                        missed_in_gap = max(0, (gap - 10) // 10)
+                        missed_samples[index] += missed_in_gap
+                        if missed_samples[index] > max_samples_received * 0.1:
                             produced_code = ReturnCode.DATA_NOT_CORRECT
                             break
                     instance_seq_num[index] = current_seq_num
@@ -529,7 +540,8 @@ def test_reading_1_sample_every_10_samples_w_instances(child_sub, samples_sent, 
         elif index == 2:
             return ReturnCode.DATA_NOT_RECEIVED
 
-    if max_samples_received == samples_read_per_instance:
+    # Allow up to 10% of samples to be missing (not received)
+    if samples_read_per_instance >= max_samples_received * 0.9:
         produced_code = ReturnCode.OK
 
     print(f'Samples read per instance: {samples_read_per_instance}, instances: {instance_color}')

@@ -785,8 +785,8 @@ rtps_test_suite_1 = {
     },
 
     'Test_TimeBasedFilter_0' : {
-        'apps' : ['-P -t Square -r -k 0 -z 0 --write-period 100',
-                  '-S -t Square -r -k 0 --time-filter 1000'],
+        'apps' : ['-P -t Square -z 0 --write-period 100',
+                  '-S -t Square --time-filter 1000'],
         'expected_codes' : [ReturnCode.OK, ReturnCode.OK],
         'check_function' : tsf.test_reading_1_sample_every_10_samples_w_instances,
         'title' : 'Test the behavior of the TIME_BASED_FILTER QoS',
@@ -803,8 +803,8 @@ rtps_test_suite_1 = {
     },
 
     'Test_TimeBasedFilter_1' : {
-        'apps' : ['-P -t Square -r -k 0 -z 0 --write-period 100 --num-instances 4',
-                  '-S -t Square -r -k 0 --time-filter 1000'],
+        'apps' : ['-P -t Square -z 0 --write-period 100 --num-instances 4',
+                  '-S -t Square --time-filter 1000'],
         'expected_codes' : [ReturnCode.OK, ReturnCode.OK],
         'check_function' : tsf.test_reading_1_sample_every_10_samples_w_instances,
         'title' : 'Test the behavior of the TIME_BASED_FILTER QoS with several instances',
