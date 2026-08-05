@@ -91,6 +91,9 @@ void configure_rtps()
 
   RtpsDiscovery_rch disc = make_rch<RtpsDiscovery>("RtpsDiscovery");
   disc->use_xtypes(RtpsDiscoveryConfig::XTYPES_NONE);
+  #if OPENDDS_VERSION_AT_LEAST(3, 35, 0)
+    disc->use_rtps_duration_fraction(true);
+  #endif
   TheServiceParticipant->add_discovery(static_rchandle_cast<Discovery>(disc));
   TheServiceParticipant->set_default_discovery(disc->key());
 }
