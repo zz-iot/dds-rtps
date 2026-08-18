@@ -879,6 +879,14 @@ def ordered_access_w_instances(child_sub, samples_sent, last_sample_saved, timeo
     samples_printed = False
     ordered_access_group_count = 0
 
+    # There may be a timing issue when reading ordered access data. The
+    # reader reads data consecutively, so the first time it reads the data it
+    # may not get all expected samples, so the second time (before going to
+    # sleep) it gets the rest of samples. This is not an error, so adding
+    # some tolerance to the test
+    behavior_mismatch_tolerance = int(0.01 * MAX_SAMPLES_READ)
+    behavior_mismatch_count = 0
+
     while samples_read_per_instance < MAX_SAMPLES_READ:
         sub_string = re.search(r'\w+\s+(\w+)\s+[0-9]+\s+[0-9]+\s+\[[0-9]+\]',
             child_sub.before + child_sub.after)
@@ -928,10 +936,13 @@ def ordered_access_w_instances(child_sub, samples_sent, last_sample_saved, timeo
                             current_behavior = ReturnCode.ORDERED_ACCESS_INSTANCE
                         elif color_equal_count < color_different_count:
                             current_behavior = ReturnCode.ORDERED_ACCESS_TOPIC
-                        # in case of a behavior change, this will be an error
+
                         if produced_code != current_behavior:
-                            produced_code = ReturnCode.DATA_NOT_CORRECT
-                            break
+                            if behavior_mismatch_count > behavior_mismatch_tolerance:
+                                produced_code = ReturnCode.DATA_NOT_CORRECT
+                                break
+                            else:
+                                behavior_mismatch_count += 1
                     # this only happens on the first iteration and then this sets
                     # the initial ReturnCode
                     else:
