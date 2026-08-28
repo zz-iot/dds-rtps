@@ -989,151 +989,108 @@ def ordered_access_w_instances(child_sub, samples_sent, last_sample_saved, timeo
 
 def coherent_sets_w_instances(child_sub, samples_sent, last_sample_saved, timeout):
     """
-    This function tests that coherent sets works correctly. This counts the
-    consecutive samples received from the same instance. The value should be 3
-    as this is the coherent set count that the test is setting.
-    Note: when using GROUP_PRESENTATION, the first iteration may print more
-    samples (more coherent sets), the test checks that the samples received per
-    instance is a multiple of 3, so the coherent sets are received complete.
-    child_sub: child program generated with pexpect
-    samples_sent: not used
-    last_sample_saved: not used
-    timeout: time pexpect waits until it matches a pattern
+    Checks coherent-set delivery for the publisher configuration these tests use
+    (--num-topics 3, --num-instances 4, --coherent-sample-count 3): one coherent
+    set is 3 topics x 4 instances x 3 samples = 36 samples, and "size" increases
+    by one on every write.
+
+    A subscriber take()s on its own period, so a read can return part of a
+    coherent set, one, or several.  Instead of assuming one read == one set,
+    this collects every (topic, color, size) the subscriber prints and checks,
+    over the whole run:
+      * each instance's sizes are strictly increasing with no duplicates
+      * when the publisher writes an instance's samples consecutively, the
+        samples one read returns for that instance always come in whole
+        multiples of --coherent-sample-count, i.e. an instance's coherent set is
+        never split across reads.  A publisher that round-robins its instances
+        interleaves the sets on the wire, so for it only the ordering check
+        applies.
+      * all topics/instances were seen and several coherent sets were received.
     """
-
     basic_check_retcode = basic_check(child_sub, samples_sent, last_sample_saved, timeout)
-
     if basic_check_retcode != ReturnCode.OK:
         return basic_check_retcode
 
-    produced_code = ReturnCode.DATA_NOT_RECEIVED
+    coherent_sample_count = 3                    # --coherent-sample-count
+    num_topics, num_instances = 3, 4             # --num-topics / --num-instances
+    sets_target = 25                            # stop once this many sets have arrived
+    sets_min = 5                                # fewer than this => data did not flow
 
-    topics = {}
-    samples_read_per_instance = 0
-    previous_sample_color = None
-    new_coherent_set_read = False
-    first_time_reading = True
-    ignore_firsts_coherent_set = 2
-    coherent_sets_count = 0
-    coherent_set_sample_count = 0
-    coherent_sets_max_count = MAX_SAMPLES_READ / 5 # 100
+    samples = {}                               # (topic, color) -> [(read_index, size), ...]
+    read_index = 0
+    prev_key = None
+    adjacent_same = adjacent_total = 0         # consecutive same-instance samples in the stream
 
-    while samples_read_per_instance < coherent_sets_max_count:
-        sub_string = re.search(r'(\w+)\s+(\w+)\s+[0-9]+\s+[0-9]+\s+\[[0-9]+\]',
+    while True:
+        sub_string = re.search(
+            r'(\w+)\s+(\w+)\s+[0-9]+\s+[0-9]+\s+\[([0-9]+)\]\s*$',
             child_sub.before + child_sub.after)
-        topic_name = None
-        instance_color = None
-
-        # if a sample is read
         if sub_string is not None:
-            # DataReader has received a new coherent set
-            new_coherent_set_read = True
-            # add new instances to the corresponding topic
-            topic_name = sub_string.group(1)
-            instance_color = sub_string.group(2)
+            key = (sub_string.group(1), sub_string.group(2))
+            samples.setdefault(key, []).append((read_index, int(sub_string.group(3))))
+            if prev_key is not None:
+                adjacent_total += 1
+                adjacent_same += (key == prev_key)
+            prev_key = key
+            if min((len(v) for v in samples.values()), default=0) >= sets_target * coherent_sample_count:
+                break
 
-            if topic_name not in topics:
-                topics[topic_name] = {}
-            if instance_color not in topics[topic_name]:
-                topics[topic_name][instance_color] = None
-            # if the instance is already added
-            if instance_color in topics[topic_name]:
-                # the instance exists
-                current_color = instance_color
-                # check the previous color and increase consecutive samples
-                if previous_sample_color is not None:
-                    if current_color == previous_sample_color:
-                        if topics[topic_name][instance_color] is None:
-                            topics[topic_name][instance_color] = 1
-                        topics[topic_name][instance_color] += 1
-                previous_sample_color = current_color
-        # different message than a sample
-        else:
-            sub_string = re.search(r'Reading coherent sets',
-                child_sub.before + child_sub.after)
-            # if 'Reading coherent sets' message, it means that the DataReader
-            # is trying to read a new coherent set, it might not read any sample
-            if sub_string is not None:
-                # if DataReader has received samples
-                if ignore_firsts_coherent_set != 0 and new_coherent_set_read:
-                    ignore_firsts_coherent_set -= 1
-                    coherent_set_sample_count = 0
-                    for topic in topics:
-                        for color in topics[topic]:
-                            topics[topic][color] = None
-                elif new_coherent_set_read:
-                    # the test is only ok if it has received coherent sets
-                    produced_code = ReturnCode.OK
-                    # each set has 4 instances, 3 samples per instance, 3 topics
-                    # therefore, each set contains 4*3*3 = 36 samples, if the count
-                    # is different than 36, it means that there is an error
-                    if coherent_set_sample_count != 36:
-                        print(f'Coherent set sample count is {coherent_set_sample_count} instead of 36')
-                        produced_code = ReturnCode.DATA_NOT_CORRECT
-                        break
-                    else:
-                        coherent_set_sample_count = 0
-                    for topic in topics:
-                        for color in topics[topic]:
-                            if first_time_reading:
-                                # with group presentation we may get several coherent
-                                # sets at the beginning, just checking that the samples
-                                # received are multiple of 3 (coherent set count)
-                                if topics[topic][color] is not None and topics[topic][color] % 3 != 0:
-                                    print(f'Coherent set count for topic {topic} and instance {color} is {topics[topic][color]} instead of 3')
-                                    produced_code = ReturnCode.DATA_NOT_CORRECT
-                                    break
-                            else:
-                                # there should be 3 consecutive samples per instance,
-                                # as the test specifies this with the argument
-                                # --coherent-sample-count 3
-                                if topics[topic][color] is not None and topics[topic][color] != 3:
-                                    print(f'Coherent set count for topic {topic} and instance {color} is {topics[topic][color]} instead of 3')
-                                    produced_code = ReturnCode.DATA_NOT_CORRECT
-                                    break
-                            topics[topic][color] = None
-                    if produced_code == ReturnCode.DATA_NOT_CORRECT:
-                        break
-                    first_time_reading = False
-                new_coherent_set_read = False
-
-        # Get the next sample the subscriber is receiving or the next
-        # 'Reading with ordered access message'
         index = child_sub.expect(
             [
-                r'\[[0-9]+\]', # index = 0
-                r'Reading coherent sets.*?\n', # index = 1
-                pexpect.TIMEOUT, # index = 2
-                pexpect.EOF # index = 3
+                r'\[[0-9]+\]',                   # index 0: a sample line
+                r'Reading coherent sets.*?\n',   # index 1: subscriber starting a new read
+                pexpect.TIMEOUT,                 # index 2
+                pexpect.EOF,                     # index 3
             ],
-            timeout
-        )
-        if index == 0:
-            # increase samples_read_per_instance only for the first topic and instance
-            if (topic_name is not None and instance_color is not None
-                    and topic_name == list(topics.keys())[0]
-                    and instance_color == list(topics[topic_name].keys())[0]):
-                samples_read_per_instance += 1
-            coherent_set_sample_count += 1
-        elif index == 1:
-            coherent_sets_count += 1
-        elif index == 2:
-            # no more data to process
-            break
-        elif index == 3:
-            produced_code = ReturnCode.DATA_NOT_RECEIVED
+            timeout)
+        if index == 1:
+            read_index += 1
+            prev_key = None                     # a read boundary breaks the run
+        elif index == 2 or index == 3:
             break
 
-        # Exit condition in case there are no samples being printed
-        if coherent_sets_count > MAX_SAMPLES_READ:
-            # If we have not read enough samples, we consider it a failure
-            if samples_read_per_instance < MAX_SAMPLES_READ:
-                produced_code = ReturnCode.DATA_NOT_RECEIVED
-            break
+    if not samples:
+        return ReturnCode.DATA_NOT_RECEIVED
 
-    print(f'Samples read per instance: {samples_read_per_instance}')
-    print("Instances:")
-    for topic in topics:
-        print(f"Topic {topic}: {', '.join(topics[topic].keys())}")
+    topics = {}
+    for topic, color in samples:
+        topics.setdefault(topic, set()).add(color)
+    sets_received = min(len(v) for v in samples.values()) // coherent_sample_count
+    print(f'Coherent sets: {sets_received} received, '
+          f'{len(samples)} instances across {len(topics)} topics')
+    if (len(topics) < num_topics
+            or any(len(colors) < num_instances for colors in topics.values())
+            or sets_received < sets_min):
+        return ReturnCode.DATA_NOT_RECEIVED
 
-    return produced_code
+    # instance-outer publisher: an instance\'s samples are written consecutively,
+    # so most adjacent samples in the stream are the same instance.  round-robin
+    # publisher: almost none are.
+    instance_outer = adjacent_total > 0 and adjacent_same / adjacent_total > 0.3
+
+    for (topic, color), lst in samples.items():
+        sizes = [s for _, s in lst]
+        for a, b in zip(sizes, sizes[1:]):
+            if b <= a:
+                print(f'{topic}/{color}: size {a} then {b} '
+                      f'({"duplicate" if b == a else "out of order"})')
+                return ReturnCode.DATA_NOT_CORRECT
+        if not instance_outer:
+            continue
+        # number of this instance\'s samples returned by each read
+        per_read = []
+        for r, _ in lst:
+            if per_read and per_read[-1][0] == r:
+                per_read[-1][1] += 1
+            else:
+                per_read.append([r, 1])
+        # the first and last read can be partial (join / shutdown); every read
+        # in between must return a whole number of coherent sets for the instance
+        for r, n in per_read[1:-1]:
+            if n % coherent_sample_count != 0:
+                print(f'{topic}/{color}: one read returned {n} samples '
+                      f'(not a multiple of {coherent_sample_count}); '
+                      f'coherent set split across reads')
+                return ReturnCode.DATA_NOT_CORRECT
+
+    return ReturnCode.OK
