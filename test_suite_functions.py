@@ -1004,8 +1004,15 @@ def ordered_access_w_instances(child_sub, samples_sent, last_sample_saved, timeo
                             else:
                                 behavior_mismatch_count += 1
                     # this only happens on the first iteration and then this sets
-                    # the initial ReturnCode
-                    else:
+                    # the initial ReturnCode. A reader may call take() more than
+                    # once per read, and samples that arrive between the calls
+                    # come back as a second group, so one read can hold two runs
+                    # of the instances. With k instances, two such runs look like
+                    # TOPIC_PRESENTATION unless the read holds at least 4*k
+                    # samples, so the initial ReturnCode is only set from a read
+                    # that large.
+                    elif (color_equal_count + color_different_count
+                            >= 4 * len(instance_color)):
                         if color_equal_count > color_different_count:
                             produced_code = ReturnCode.ORDERED_ACCESS_INSTANCE
                         elif color_equal_count < color_different_count:
